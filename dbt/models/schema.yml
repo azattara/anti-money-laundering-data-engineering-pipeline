@@ -1,5 +1,8 @@
 version: 2
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Sources
+# ─────────────────────────────────────────────────────────────────────────────
 sources:
   - name: aml_bronze
     description: "Raw IBM AML transactions ingested from Kaggle into BigQuery"
@@ -17,17 +20,209 @@ sources:
       - name: transactions
         description: "Deduplicated, null-cleaned, type-cast transaction records"
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Models
+# ─────────────────────────────────────────────────────────────────────────────
 models:
-  - name: stg_transactions_bronze
-    description: "Thin view over raw Bronze transactions"
 
+  # ── Bronze ─────────────────────────────────────────────────────────────────
+  - name: stg_transactions_bronze
+    description: "Thin view over raw Bronze transactions — no transformations"
+
+  # ── Silver ─────────────────────────────────────────────────────────────────
   - name: stg_transactions_silver
-    description: "Cleaned Silver transactions with dedup row numbers"
+    description: >
+      Legacy Silver staging model (kept for backwards compatibility).
+      Prefer fct_transactions_silver for all new downstream models.
+
+  - name: fct_transactions_silver
+    description: >
+      Canonical Silver fact table: one row per unique transaction.
+      Cleaned, deduplicated, fully typed.  This is the single source of truth
+      for all Gold / feature-store models.
     columns:
-      - name: amount
-        description: "Transaction amount in USD"
+      - name: customer_id
+        description: "Sending customer identifier (from_id cast to STRING)"
         tests:
           - not_null
+      - name: counterparty_id
+        description: "Receiving counterparty identifier (to_id cast to STRING)"
+        tests:
+          - not_null
+      - name: amount
+        description: "Transaction amount (USD, positive values only)"
+        tests:
+          - not_null
+      - name: event_time
+        description: "Exact UTC timestamp of the transaction"
+        tests:
+          - not_null
+      - name: feature_date
+        description: "Calendar date derived from event_time — partition key for Gold"
+        tests:
+          - not_null
+      - name: payment_format
+        description: "Payment rail / instrument type (e.g. WIRE, CASH, ACH)"
+      - name: payment_currency
+        description: "Currency used to send the transaction"
+      - name: receiving_currency
+        description: "Currency in which funds were received"
+      - name: is_laundering
+        description: "Ground-truth label (1=laundering, 0=clean, NULL=unknown). Never exposed in feature store."
+      - name: _ingested_at
+        description: "Timestamp when the record was ingested into Bronze"
 
+  # ── Gold / Feature Store ────────────────────────────────────────────────────
   - name: mart_transactions_gold
-    description: "Aggregated transaction summary per sender-receiver pair (Gold)"
+    description: >
+      Legacy Gold aggregation at sender-receiver pair level.
+      Kept for backwards compatibility; canonical feature store is
+      mart_customer_features_gold → feature_store_customer_features.
+
+  - name: mart_customer_features_gold
+    description: >
+      AML customer feature store (intermediate/compute layer).
+      Grain: (customer_id, feature_date).
+      Incrementally materialized with 90-day lookback.
+      Partitioned by feature_date, clustered by customer_id.
+    columns:
+      - name: customer_id
+        description: "Customer entity key"
+        tests:
+          - not_null
+      - name: feature_date
+        description: "Feature computation date — partition key"
+        tests:
+          - not_null
+      - name: tx_count_1d
+        description: "Transaction count on feature_date"
+      - name: days_since_last_tx
+        description: "Days between feature_date and previous active day (NULL on first day)"
+      - name: tx_count_7d
+        description: "Rolling 7-day transaction count"
+      - name: tx_count_30d
+        description: "Rolling 30-day transaction count"
+      - name: tx_count_90d
+        description: "Rolling 90-day transaction count"
+      - name: tx_amount_sum_7d
+        description: "Rolling 7-day total amount"
+      - name: tx_amount_avg_7d
+        description: "Rolling 7-day average amount"
+      - name: tx_amount_max_7d
+        description: "Rolling 7-day maximum amount"
+      - name: tx_amount_sum_30d
+        description: "Rolling 30-day total amount"
+      - name: tx_amount_avg_30d
+        description: "Rolling 30-day average amount"
+      - name: tx_amount_max_30d
+        description: "Rolling 30-day maximum amount"
+      - name: tx_amount_sum_90d
+        description: "Rolling 90-day total amount"
+      - name: tx_amount_avg_90d
+        description: "Rolling 90-day average amount"
+      - name: tx_amount_max_90d
+        description: "Rolling 90-day maximum amount"
+      - name: unique_counterparties_1d
+        description: "Distinct counterparties on feature_date"
+      - name: unique_counterparties_7d
+        description: "Rolling sum of daily distinct counterparties (7d) — upper-bound proxy for true 7-day unique count"
+      - name: unique_counterparties_30d
+        description: "Rolling sum of daily distinct counterparties (30d) — upper-bound proxy"
+      - name: unique_counterparties_90d
+        description: "Rolling sum of daily distinct counterparties (90d) — upper-bound proxy"
+      - name: cross_currency_tx_count_30d
+        description: "Cross-currency transactions in last 30 days"
+      - name: cross_currency_tx_count_90d
+        description: "Cross-currency transactions in last 90 days"
+      - name: unique_payment_currencies_30d
+        description: "Distinct payment currencies in 30 days"
+      - name: unique_payment_formats_90d
+        description: "Distinct payment formats in 90 days"
+      - name: cross_currency_ratio_30d
+        description: "Fraction of 30d transactions that are cross-currency"
+      - name: cross_currency_ratio_90d
+        description: "Fraction of 90d transactions that are cross-currency"
+      - name: counterparty_concentration_30d
+        description: "Unique counterparties / tx count (30d) — low = concentrated = layering signal"
+      - name: amount_max_to_avg_ratio_7d
+        description: "Max/avg amount (7d) — structuring proxy"
+      - name: velocity_spike_ratio_7d
+        description: "7d tx count / 30d daily avg — velocity spike indicator"
+      - name: feature_version
+        description: "Feature definition version"
+      - name: source_model
+        description: "dbt model that produced this row"
+      - name: feature_created_at
+        description: "Timestamp this row was created/refreshed"
+
+  - name: feature_store_customer_features
+    description: >
+      AML Customer Feature Store — published serving layer.
+      Grain: (customer_id, feature_date).
+      Only features passing rule-based selection are published:
+        RULE-1: null-rate > 30% excluded or coalesced.
+        RULE-2: constant/low-variance features excluded.
+        RULE-3: redundant/correlated features reduced to one representative.
+        RULE-4: target-leakage columns (is_laundering) never published.
+      See models/gold/feature_store_customer_features.sql for full documentation.
+    columns:
+      - name: customer_id
+        description: "Customer entity key"
+        tests:
+          - not_null
+      - name: feature_date
+        description: "Feature date — partition key"
+        tests:
+          - not_null
+      - name: days_since_last_tx
+        description: "Days since previous active day (-1 on first day)"
+      - name: tx_count_7d
+        description: "Rolling 7-day transaction count"
+      - name: tx_count_30d
+        description: "Rolling 30-day transaction count"
+      - name: tx_count_90d
+        description: "Rolling 90-day transaction count"
+      - name: tx_amount_sum_7d
+        description: "Rolling 7-day total amount"
+      - name: tx_amount_avg_7d
+        description: "Rolling 7-day average amount"
+      - name: tx_amount_max_7d
+        description: "Rolling 7-day maximum amount"
+      - name: tx_amount_sum_30d
+        description: "Rolling 30-day total amount"
+      - name: tx_amount_avg_30d
+        description: "Rolling 30-day average amount"
+      - name: tx_amount_sum_90d
+        description: "Rolling 90-day total amount"
+      - name: tx_amount_avg_90d
+        description: "Rolling 90-day average amount"
+      - name: unique_counterparties_7d
+        description: "Rolling sum of daily distinct counterparties (7d) — upper-bound proxy"
+      - name: unique_counterparties_30d
+        description: "Rolling sum of daily distinct counterparties (30d) — upper-bound proxy"
+      - name: unique_counterparties_90d
+        description: "Rolling sum of daily distinct counterparties (90d) — upper-bound proxy"
+      - name: cross_currency_tx_count_30d
+        description: "Cross-currency transactions (30d)"
+      - name: cross_currency_tx_count_90d
+        description: "Cross-currency transactions (90d)"
+      - name: unique_payment_currencies_30d
+        description: "Distinct payment currencies (30d)"
+      - name: unique_payment_formats_90d
+        description: "Distinct payment formats (90d)"
+      - name: cross_currency_ratio_30d
+        description: "Cross-currency ratio (30d)"
+      - name: cross_currency_ratio_90d
+        description: "Cross-currency ratio (90d)"
+      - name: counterparty_concentration_30d
+        description: "Counterparty concentration proxy (30d)"
+      - name: amount_max_to_avg_ratio_7d
+        description: "Structuring proxy: max/avg amount ratio (7d)"
+      - name: velocity_spike_ratio_7d
+        description: "Velocity spike indicator"
+      - name: feature_version
+        description: "Feature definition version"
+      - name: source_model
+        description: "Upstream dbt model"
+      - name: feature_created_at
+        description: "Row creation timestamp"
