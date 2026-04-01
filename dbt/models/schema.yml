@@ -1,0 +1,33 @@
+version: 2
+
+sources:
+  - name: aml_bronze
+    description: "Raw IBM AML transactions ingested from Kaggle into BigQuery"
+    database: anti-ml-data-engineering
+    schema: aml_bronze
+    tables:
+      - name: transactions
+        description: "Raw transaction records — no transformations applied"
+
+  - name: aml_silver
+    description: "Cleaned AML transactions written by PySpark Silver job"
+    database: anti-ml-data-engineering
+    schema: aml_silver
+    tables:
+      - name: transactions
+        description: "Deduplicated, null-cleaned, type-cast transaction records"
+
+models:
+  - name: stg_transactions_bronze
+    description: "Thin view over raw Bronze transactions"
+
+  - name: stg_transactions_silver
+    description: "Cleaned Silver transactions with dedup row numbers"
+    columns:
+      - name: amount
+        description: "Transaction amount in USD"
+        tests:
+          - not_null
+
+  - name: mart_transactions_gold
+    description: "Aggregated transaction summary per sender-receiver pair (Gold)"

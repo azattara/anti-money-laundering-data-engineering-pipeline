@@ -1,0 +1,68 @@
+version: "3.8"
+
+services:
+  postgres:
+    image: postgres:15
+    container_name: kestra-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${KESTRA_POSTGRES_USER:-kestra}
+      POSTGRES_PASSWORD: ${KESTRA_POSTGRES_PASSWORD:-kestra}
+      POSTGRES_DB: ${KESTRA_POSTGRES_DB:-kestra}
+    volumes:
+      - kestra-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${KESTRA_POSTGRES_USER:-kestra}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  kestra:
+    image: kestra/kestra:latest
+    container_name: kestra
+    restart: unless-stopped
+    pull_policy: always
+    user: "root"
+    command: server standalone
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      KESTRA_CONFIGURATION: |
+        datasources:
+          postgres:
+            url: jdbc:postgresql://postgres:5432/${KESTRA_POSTGRES_DB:-kestra}
+            driverClassName: org.postgresql.Driver
+            username: ${KESTRA_POSTGRES_USER:-kestra}
+            password: ${KESTRA_POSTGRES_PASSWORD:-kestra}
+        kestra:
+          server:
+            basic-auth:
+              enabled: false
+          repository:
+            type: postgres
+          storage:
+            type: gcs
+            gcs:
+              bucket: ${GCS_ARTIFACTS_BUCKET:-anti-ml-data-engineering-artifacts}
+              project-id: ${GCP_PROJECT_ID:-anti-ml-data-engineering}
+          queue:
+            type: postgres
+          tasks:
+            tmp-dir:
+              path: /tmp/kestra-wd/tmp
+    volumes:
+      # Mount GCP service account key
+      - ${GOOGLE_APPLICATION_CREDENTIALS:-./credentials.json}:/run/secrets/gcp-sa.json:ro
+      # Mount project source code so Kestra Python tasks can import ingestion/ and spark/ modules
+      - .:/app:ro
+      - kestra-data:/app/storage
+    ports:
+      - "${KESTRA_PORT:-8080}:8080"
+      - "8081:8081"
+    env_file:
+      - .env
+
+volumes:
+  kestra-postgres-data:
+  kestra-data:
