@@ -1,0 +1,122 @@
+id: aml_medallion_pipeline
+namespace: anti_money_laundering
+
+description: |
+  IBM Anti Money Laundering — Medallion Architecture Pipeline (Bronze / Silver / Gold)
+
+  Steps:
+    1. Bronze — Download IBM AML dataset from Kaggle
+    2. Bronze — Upload raw files to GCS Bronze bucket
+    3. Silver — Run PySpark job to clean data and write to BigQuery
+    4. Gold   — Placeholder: validate dbt structure (profiles.yml + dbt_project.yml)
+
+labels:
+  project: anti-money-laundering
+  env: production
+  layer: medallion
+
+inputs:
+  - id: kaggle_dataset
+    type: STRING
+    defaults: ealtman2019/ibm-transactions-for-anti-money-laundering-aml
+    description: "Kaggle dataset slug (owner/dataset-name)"
+
+  - id: gcs_bronze_bucket
+    type: STRING
+    defaults: anti-ml-data-engineering-bronze
+    description: "GCS Bronze bucket name"
+
+  - id: gcs_silver_bucket
+    type: STRING
+    defaults: anti-ml-data-engineering-silver
+    description: "GCS Silver bucket name"
+
+  - id: gcp_project_id
+    type: STRING
+    defaults: anti-ml-data-engineering
+    description: "GCP Project ID"
+
+variables:
+  download_dir: /tmp/aml_raw
+  gcs_prefix: raw
+
+tasks:
+
+  # ------------------------------------------------------------------ #
+  # BRONZE — Step 1: Download dataset from Kaggle                        #
+  # ------------------------------------------------------------------ #
+  - id: bronze_kaggle_download
+    type: io.kestra.plugin.scripts.python.Script
+    description: "Download IBM AML dataset from Kaggle into /tmp/aml_raw"
+    env:
+      KAGGLE_USERNAME: "{{ secret('KAGGLE_USERNAME') }}"
+      KAGGLE_KEY: "{{ secret('KAGGLE_KEY') }}"
+      KAGGLE_DATASET: "{{ inputs.kaggle_dataset }}"
+      DOWNLOAD_DIR: "{{ vars.download_dir }}"
+    script: |
+      import os, sys
+      sys.path.insert(0, '/app')
+      from ingestion.kaggle_download import download_dataset
+      from pathlib import Path
+      download_dataset(
+          dataset=os.environ['KAGGLE_DATASET'],
+          output_dir=Path(os.environ['DOWNLOAD_DIR'])
+      )
+
+  # ------------------------------------------------------------------ #
+  # BRONZE — Step 2: Upload raw files to GCS Bronze bucket               #
+  # ------------------------------------------------------------------ #
+  - id: bronze_upload_to_gcs
+    type: io.kestra.plugin.scripts.python.Script
+    description: "Upload downloaded files to GCS Bronze bucket"
+    env:
+      GOOGLE_APPLICATION_CREDENTIALS: "{{ secret('GCP_SA_KEY_PATH') }}"
+      GCS_BRONZE_BUCKET: "{{ inputs.gcs_bronze_bucket }}"
+      DOWNLOAD_DIR: "{{ vars.download_dir }}"
+    script: |
+      import os, sys
+      sys.path.insert(0, '/app')
+      from ingestion.upload_to_gcs import upload_directory_to_gcs
+      from pathlib import Path
+      upload_directory_to_gcs(
+          local_dir=Path(os.environ['DOWNLOAD_DIR']),
+          bucket_name=os.environ['GCS_BRONZE_BUCKET'],
+      )
+
+  # ------------------------------------------------------------------ #
+  # SILVER — Step 3: PySpark cleaning job → BigQuery                     #
+  # ------------------------------------------------------------------ #
+  - id: silver_pyspark_clean
+    type: io.kestra.plugin.scripts.shell.Commands
+    description: "Run PySpark job: clean raw data and write Silver layer to BigQuery"
+    env:
+      GOOGLE_APPLICATION_CREDENTIALS: "{{ secret('GCP_SA_KEY_PATH') }}"
+      GCP_PROJECT_ID: "{{ inputs.gcp_project_id }}"
+      GCS_BRONZE_BUCKET: "{{ inputs.gcs_bronze_bucket }}"
+      GCS_SILVER_BUCKET: "{{ inputs.gcs_silver_bucket }}"
+    commands:
+      - |
+        spark-submit \
+          --packages com.google.cloud.spark:spark-bigquery-with-dependencies_2.12:0.34.0 \
+          /app/spark/clean_aml_data.py
+
+  # ------------------------------------------------------------------ #
+  # GOLD — Step 4: Placeholder — validate dbt structure                  #
+  # ------------------------------------------------------------------ #
+  - id: gold_dbt_validate
+    type: io.kestra.plugin.scripts.shell.Commands
+    description: "Validate dbt project structure (placeholder for Gold layer)"
+    commands:
+      - |
+        echo "=== Gold layer: validating dbt structure ==="
+        test -f /app/dbt/dbt_project.yml && echo "dbt_project.yml found ✓" || (echo "ERROR: dbt_project.yml missing" && exit 1)
+        test -f /app/dbt/profiles.yml   && echo "profiles.yml found ✓"    || echo "WARN: profiles.yml not found (expected in ~/.dbt/ or dbt/ for CI)"
+        echo "dbt structure validation passed."
+        echo "NOTE: Full dbt model execution (dbt run) will be implemented in the next iteration."
+
+errors:
+  - id: notify_on_failure
+    type: io.kestra.plugin.scripts.shell.Commands
+    description: "Log pipeline failure"
+    commands:
+      - echo "Pipeline FAILED at task {{ task.id }} — check Kestra UI for details"
