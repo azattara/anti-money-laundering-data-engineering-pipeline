@@ -1,0 +1,27 @@
+# dbt profiles.yml — example/template
+# Copy this file to ~/.dbt/profiles.yml and fill in your values.
+# Do NOT commit your actual profiles.yml — it contains credentials.
+#
+# This file is tracked as dbt/profiles.yml.example in the repo.
+
+anti_money_laundering:
+  target: dev
+  outputs:
+    dev:
+      type: bigquery
+      method: service-account
+      project: anti-ml-data-engineering
+      dataset: aml_gold
+      threads: 4
+      timeout_seconds: 300
+      keyfile: "{{ env_var('GOOGLE_APPLICATION_CREDENTIALS') }}"
+      location: US
+    prod:
+      type: bigquery
+      method: service-account
+      project: anti-ml-data-engineering
+      dataset: aml_gold
+      threads: 8
+      timeout_seconds: 300
+      keyfile: "{{ env_var('GOOGLE_APPLICATION_CREDENTIALS') }}"
+      location: US
