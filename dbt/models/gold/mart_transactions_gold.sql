@@ -1,6 +1,9 @@
 -- models/gold/mart_transactions_gold.sql
--- Gold layer: aggregated transaction summary for analytics and dashboards.
--- Placeholder model — extend with business logic as requirements are refined.
+-- Gold layer: aggregated transaction summary per sender-receiver pair.
+-- DEPRECATED: kept for backwards compatibility.
+-- The canonical feature store is mart_customer_features_gold →
+-- feature_store_customer_features (grain: customer_id × feature_date,
+-- incremental, partitioned by feature_date, clustered by customer_id).
 
 {{ config(materialized='table', schema='aml_gold') }}
 

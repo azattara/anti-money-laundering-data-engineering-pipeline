@@ -4,11 +4,16 @@ namespace: anti_money_laundering
 description: |
   IBM Anti Money Laundering — Medallion Architecture Pipeline (Bronze / Silver / Gold)
 
+  Execution modes:
+    - INCREMENTAL (default): processes only new data for the given partition_date.
+    - FULL_REFRESH: reprocesses all Bronze data (WRITE_TRUNCATE in Silver,
+      dbt full-refresh in Gold).
+
   Steps:
-    1. Bronze — Download IBM AML dataset from Kaggle
-    2. Bronze — Upload raw files to GCS Bronze bucket
-    3. Silver — Run PySpark job to clean data and write to BigQuery
-    4. Gold   — Placeholder: validate dbt structure (profiles.yml + dbt_project.yml)
+    1. Bronze  — Download IBM AML dataset from Kaggle (date-partitioned prefix)
+    2. Bronze  — Upload raw files to GCS Bronze bucket under partitions/<date>/
+    3. Silver  — Run PySpark job for the specific date partition(s)
+    4. Gold    — Run dbt incremental (or full-refresh) for feature store
 
 labels:
   project: anti-money-laundering
@@ -36,15 +41,25 @@ inputs:
     defaults: anti-ml-data-engineering
     description: "GCP Project ID"
 
+  - id: partition_date
+    type: STRING
+    defaults: "{{ now() | dateAdd(-1, 'DAYS') | date('yyyy-MM-dd') }}"
+    description: "Date partition to process (YYYY-MM-DD). Defaults to yesterday."
+
+  - id: run_mode
+    type: STRING
+    defaults: INCREMENTAL
+    description: "INCREMENTAL or FULL_REFRESH"
+
 variables:
   download_dir: /tmp/aml_raw
-  gcs_prefix: raw
+  gcs_partition_prefix: "partitions/{{ inputs.partition_date }}"
 
 tasks:
 
-  # ------------------------------------------------------------------ #
-  # BRONZE — Step 1: Download dataset from Kaggle                        #
-  # ------------------------------------------------------------------ #
+  # ──────────────────────────────────────────────────────────────────────────
+  # BRONZE — Step 1: Download dataset from Kaggle into date-partitioned dir
+  # ──────────────────────────────────────────────────────────────────────────
   - id: bronze_kaggle_download
     type: io.kestra.plugin.scripts.python.Script
     description: "Download IBM AML dataset from Kaggle into /tmp/aml_raw"
@@ -53,6 +68,7 @@ tasks:
       KAGGLE_KEY: "{{ secret('KAGGLE_KEY') }}"
       KAGGLE_DATASET: "{{ inputs.kaggle_dataset }}"
       DOWNLOAD_DIR: "{{ vars.download_dir }}"
+      PARTITION_DATE: "{{ inputs.partition_date }}"
     script: |
       import os, sys
       sys.path.insert(0, '/app')
@@ -60,63 +76,101 @@ tasks:
       from pathlib import Path
       download_dataset(
           dataset=os.environ['KAGGLE_DATASET'],
-          output_dir=Path(os.environ['DOWNLOAD_DIR'])
+          output_dir=Path(os.environ['DOWNLOAD_DIR']) / os.environ['PARTITION_DATE']
       )
 
-  # ------------------------------------------------------------------ #
-  # BRONZE — Step 2: Upload raw files to GCS Bronze bucket               #
-  # ------------------------------------------------------------------ #
+  # ──────────────────────────────────────────────────────────────────────────
+  # BRONZE — Step 2: Upload to GCS under date-partitioned prefix
+  # ──────────────────────────────────────────────────────────────────────────
   - id: bronze_upload_to_gcs
     type: io.kestra.plugin.scripts.python.Script
-    description: "Upload downloaded files to GCS Bronze bucket"
+    description: "Upload downloaded files to GCS Bronze bucket (partitioned by date)"
     env:
       GOOGLE_APPLICATION_CREDENTIALS: "{{ secret('GCP_SA_KEY_PATH') }}"
       GCS_BRONZE_BUCKET: "{{ inputs.gcs_bronze_bucket }}"
-      DOWNLOAD_DIR: "{{ vars.download_dir }}"
+      DOWNLOAD_DIR: "{{ vars.download_dir }}/{{ inputs.partition_date }}"
+      GCS_PREFIX: "{{ vars.gcs_partition_prefix }}"
     script: |
       import os, sys
       sys.path.insert(0, '/app')
       from ingestion.upload_to_gcs import upload_directory_to_gcs
-      from pathlib import Path
       upload_directory_to_gcs(
-          local_dir=Path(os.environ['DOWNLOAD_DIR']),
+          local_dir=os.environ['DOWNLOAD_DIR'],
           bucket_name=os.environ['GCS_BRONZE_BUCKET'],
+          gcs_prefix=os.environ['GCS_PREFIX'],
       )
 
-  # ------------------------------------------------------------------ #
-  # SILVER — Step 3: PySpark cleaning job → BigQuery                     #
-  # ------------------------------------------------------------------ #
-  - id: silver_pyspark_clean
-    type: io.kestra.plugin.scripts.shell.Commands
-    description: "Run PySpark job: clean raw data and write Silver layer to BigQuery"
+  # ──────────────────────────────────────────────────────────────────────────
+  # SILVER — Step 3: Run PySpark cleaning job for this date partition
+  # ──────────────────────────────────────────────────────────────────────────
+  - id: silver_spark_job
+    type: io.kestra.plugin.scripts.python.Script
+    description: "Run PySpark Silver job for partition {{ inputs.partition_date }}"
     env:
       GOOGLE_APPLICATION_CREDENTIALS: "{{ secret('GCP_SA_KEY_PATH') }}"
       GCP_PROJECT_ID: "{{ inputs.gcp_project_id }}"
       GCS_BRONZE_BUCKET: "{{ inputs.gcs_bronze_bucket }}"
       GCS_SILVER_BUCKET: "{{ inputs.gcs_silver_bucket }}"
-    commands:
-      - |
-        spark-submit \
-          --packages com.google.cloud.spark:spark-bigquery-with-dependencies_2.12:0.34.0 \
-          /app/spark/clean_aml_data.py
+      GCS_ARTIFACTS_BUCKET: "{{ secret('GCS_ARTIFACTS_BUCKET') }}"
+      SPARK_FULL_REFRESH: "{{ inputs.run_mode == 'FULL_REFRESH' }}"
+      PARTITION_DATE: "{{ inputs.partition_date }}"
+    script: |
+      import os, subprocess, sys
+      full_refresh = os.environ.get('SPARK_FULL_REFRESH', 'False').lower() == 'true'
+      partition_date = os.environ['PARTITION_DATE']
+      cmd = [
+          'spark-submit',
+          '--packages', 'com.google.cloud.spark:spark-bigquery-with-dependencies_2.12:0.34.0',
+          '/app/spark/clean_aml_data.py',
+      ]
+      if full_refresh:
+          cmd.append('--full-refresh')
+      else:
+          cmd.extend(['--partition-date', partition_date])
+      result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+      print(result.stdout)
+      if result.stderr:
+          print(result.stderr, file=sys.stderr)
 
-  # ------------------------------------------------------------------ #
-  # GOLD — Step 4: Placeholder — validate dbt structure                  #
-  # ------------------------------------------------------------------ #
-  - id: gold_dbt_validate
+  # ──────────────────────────────────────────────────────────────────────────
+  # GOLD — Step 4: Run dbt feature store models (incremental or full-refresh)
+  # ──────────────────────────────────────────────────────────────────────────
+  - id: gold_dbt_run
     type: io.kestra.plugin.scripts.shell.Commands
-    description: "Validate dbt project structure (placeholder for Gold layer)"
+    description: "Run dbt Gold feature store models"
+    env:
+      DBT_PROFILES_DIR: /app/dbt
+      GOOGLE_APPLICATION_CREDENTIALS: "{{ secret('GCP_SA_KEY_PATH') }}"
+      GCP_PROJECT_ID: "{{ inputs.gcp_project_id }}"
     commands:
       - |
-        echo "=== Gold layer: validating dbt structure ==="
-        test -f /app/dbt/dbt_project.yml && echo "dbt_project.yml found ✓" || (echo "ERROR: dbt_project.yml missing" && exit 1)
-        test -f /app/dbt/profiles.yml   && echo "profiles.yml found ✓"    || echo "WARN: profiles.yml not found (expected in ~/.dbt/ or dbt/ for CI)"
-        echo "dbt structure validation passed."
-        echo "NOTE: Full dbt model execution (dbt run) will be implemented in the next iteration."
+        cd /app/dbt
+        if [ "{{ inputs.run_mode }}" = "FULL_REFRESH" ]; then
+          dbt run --full-refresh \
+            --select fct_transactions_silver mart_customer_features_gold feature_store_customer_features
+        else
+          dbt run \
+            --select fct_transactions_silver mart_customer_features_gold feature_store_customer_features
+        fi
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # GOLD — Step 5: Run dbt tests on feature store output
+  # ──────────────────────────────────────────────────────────────────────────
+  - id: gold_dbt_test
+    type: io.kestra.plugin.scripts.shell.Commands
+    description: "Run dbt tests on Silver and Gold models"
+    env:
+      DBT_PROFILES_DIR: /app/dbt
+      GOOGLE_APPLICATION_CREDENTIALS: "{{ secret('GCP_SA_KEY_PATH') }}"
+      GCP_PROJECT_ID: "{{ inputs.gcp_project_id }}"
+    commands:
+      - |
+        cd /app/dbt
+        dbt test --select fct_transactions_silver mart_customer_features_gold feature_store_customer_features
 
 errors:
   - id: notify_on_failure
-    type: io.kestra.plugin.scripts.shell.Commands
-    description: "Log pipeline failure"
-    commands:
-      - echo "Pipeline FAILED at task {{ task.id }} — check Kestra UI for details"
+    type: io.kestra.plugin.core.log.Log
+    message: |
+      Pipeline FAILED for partition {{ inputs.partition_date }} (mode: {{ inputs.run_mode }}).
+      Check task logs above for details.

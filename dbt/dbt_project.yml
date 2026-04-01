@@ -25,5 +25,13 @@ models:
       +materialized: table
       +schema: aml_silver
     gold:
-      +materialized: table
+      # Default to incremental for all Gold models; individual models can override.
+      +materialized: incremental
       +schema: aml_gold
+      # BigQuery partitioning and clustering defaults for all Gold models.
+      +partition_by:
+        field: feature_date
+        data_type: date
+        granularity: day
+      +cluster_by:
+        - customer_id
