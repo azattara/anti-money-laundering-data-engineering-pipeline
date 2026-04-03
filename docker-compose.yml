@@ -21,7 +21,7 @@ services:
     image: kestra/kestra:latest
     container_name: kestra
     restart: unless-stopped
-    pull_policy: always
+    pull_policy: if_not_present
     user: "root"
     command: server standalone
     depends_on:
@@ -51,12 +51,14 @@ services:
           tasks:
             tmp-dir:
               path: /tmp/kestra-wd/tmp
+      GOOGLE_APPLICATION_CREDENTIALS: /run/secrets/gcp-sa.json
     volumes:
       # Mount GCP service account key
       - ${GOOGLE_APPLICATION_CREDENTIALS:-./credentials.json}:/run/secrets/gcp-sa.json:ro
       # Mount project source code so Kestra Python tasks can import ingestion/ and spark/ modules
-      - .:/app:ro
-      - kestra-data:/app/storage
+      - ./ingestion:/opt/aml/ingestion:ro
+      - ./spark:/opt/aml/spark:ro
+      - kestra-data:/tmp/kestra-storage
     ports:
       - "${KESTRA_PORT:-8080}:8080"
       - "8081:8081"

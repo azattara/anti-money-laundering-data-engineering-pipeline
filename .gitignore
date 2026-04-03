@@ -57,6 +57,7 @@ data/
 terraform/.terraform/
 terraform/*.tfstate
 terraform/*.tfstate.backup
+terraform/*.backup
 terraform/*.tfvars
 terraform/.terraform.lock.hcl
 terraform/override.tf
@@ -86,3 +87,5 @@ Thumbs.db
 # Logs
 *.log
 logs/
+
+.bruin.yml

@@ -55,3 +55,17 @@ variable "bq_gold_dataset" {
   type        = string
   default     = "aml_gold"
 }
+
+# ---- Kestra VM ----
+
+variable "kestra_machine_type" {
+  description = "GCE machine type for the Kestra server"
+  type        = string
+  default     = "e2-standard-2"
+}
+
+variable "kestra_allowed_cidrs" {
+  description = "List of CIDR ranges allowed to access Kestra UI (port 8080). Restrict to your IP in production."
+  type        = list(string)
+  default     = ["0.0.0.0/0"]
+}

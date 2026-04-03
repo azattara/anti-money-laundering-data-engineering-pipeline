@@ -27,3 +27,13 @@ output "bq_gold_dataset" {
   description = "BigQuery Gold dataset full ID"
   value       = "${var.project_id}.${google_bigquery_dataset.gold.dataset_id}"
 }
+
+output "kestra_url" {
+  description = "Kestra UI URL"
+  value       = "http://${google_compute_instance.kestra.network_interface[0].access_config[0].nat_ip}:8080"
+}
+
+output "kestra_service_account" {
+  description = "Email da service account do Kestra"
+  value       = google_service_account.kestra.email
+}

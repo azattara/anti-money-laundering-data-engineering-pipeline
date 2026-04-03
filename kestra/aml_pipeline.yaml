@@ -38,8 +38,13 @@ inputs:
 
   - id: gcp_project_id
     type: STRING
-    defaults: anti-ml-data-engineering
+    defaults: janestreet-data-engineering
     description: "GCP Project ID"
+
+  - id: gcp_region
+    type: STRING
+    defaults: us-central1
+    description: "GCP region where Dataproc Batches will run"
 
   - id: partition_date
     type: STRING
@@ -63,21 +68,50 @@ tasks:
   - id: bronze_kaggle_download
     type: io.kestra.plugin.scripts.python.Script
     description: "Download IBM AML dataset from Kaggle into /tmp/aml_raw"
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    beforeCommands:
+      - pip install --quiet "kaggle>=1.6"
     env:
-      KAGGLE_USERNAME: "{{ secret('KAGGLE_USERNAME') }}"
-      KAGGLE_KEY: "{{ secret('KAGGLE_KEY') }}"
+      KAGGLE_USERNAME: "{{ kv('KAGGLE_USERNAME') }}"
+      KAGGLE_KEY: "{{ kv('KAGGLE_KEY') }}"
       KAGGLE_DATASET: "{{ inputs.kaggle_dataset }}"
       DOWNLOAD_DIR: "{{ vars.download_dir }}"
       PARTITION_DATE: "{{ inputs.partition_date }}"
     script: |
-      import os, sys
-      sys.path.insert(0, '/app')
-      from ingestion.kaggle_download import download_dataset
+      import os, zipfile, subprocess, sys, logging
       from pathlib import Path
-      download_dataset(
-          dataset=os.environ['KAGGLE_DATASET'],
-          output_dir=Path(os.environ['DOWNLOAD_DIR']) / os.environ['PARTITION_DATE']
-      )
+
+      logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
+      logger = logging.getLogger(__name__)
+
+      dataset = os.environ['KAGGLE_DATASET']
+      output_dir = Path(os.environ['DOWNLOAD_DIR']) / os.environ['PARTITION_DATE']
+      output_dir.mkdir(parents=True, exist_ok=True)
+
+      # Find kaggle binary (may be installed outside PATH)
+      import shutil
+      kaggle_bin = shutil.which('kaggle') or os.path.expanduser('~/.local/bin/kaggle')
+      logger.info("Using kaggle binary: %s", kaggle_bin)
+
+      env = os.environ.copy()
+      env['PATH'] = os.path.expanduser('~/.local/bin') + ':' + env.get('PATH', '')
+
+      cmd = [kaggle_bin, 'datasets', 'download', dataset, '-p', str(output_dir)]
+      logger.info("Running: %s", ' '.join(cmd))
+      result = subprocess.run(cmd, capture_output=True, text=True, env=env)
+      if result.returncode != 0:
+          logger.error("kaggle stderr: %s", result.stderr)
+          sys.exit(result.returncode)
+      logger.info("kaggle stdout: %s", result.stdout)
+
+      for zip_path in output_dir.glob('*.zip'):
+          logger.info("Unzipping '%s'", zip_path)
+          with zipfile.ZipFile(zip_path, 'r') as zf:
+              zf.extractall(output_dir)
+          zip_path.unlink()
+
+      logger.info('Download complete. Files: %s', list(output_dir.iterdir()))
 
   # ──────────────────────────────────────────────────────────────────────────
   # BRONZE — Step 2: Upload to GCS under date-partitioned prefix
@@ -85,52 +119,76 @@ tasks:
   - id: bronze_upload_to_gcs
     type: io.kestra.plugin.scripts.python.Script
     description: "Upload downloaded files to GCS Bronze bucket (partitioned by date)"
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    beforeCommands:
+      - pip install --quiet google-cloud-storage
     env:
-      GOOGLE_APPLICATION_CREDENTIALS: "{{ secret('GCP_SA_KEY_PATH') }}"
+      GOOGLE_APPLICATION_CREDENTIALS: "{{ kv('GCP_SA_KEY_PATH') }}"
       GCS_BRONZE_BUCKET: "{{ inputs.gcs_bronze_bucket }}"
       DOWNLOAD_DIR: "{{ vars.download_dir }}/{{ inputs.partition_date }}"
       GCS_PREFIX: "{{ vars.gcs_partition_prefix }}"
     script: |
-      import os, sys
-      sys.path.insert(0, '/app')
-      from ingestion.upload_to_gcs import upload_directory_to_gcs
-      upload_directory_to_gcs(
-          local_dir=os.environ['DOWNLOAD_DIR'],
-          bucket_name=os.environ['GCS_BRONZE_BUCKET'],
-          gcs_prefix=os.environ['GCS_PREFIX'],
-      )
+      import os, logging
+      from pathlib import Path
+      from google.cloud import storage
+
+      logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
+      logger = logging.getLogger(__name__)
+
+      local_dir = Path(os.environ['DOWNLOAD_DIR'])
+      bucket_name = os.environ['GCS_BRONZE_BUCKET']
+      gcs_prefix = os.environ['GCS_PREFIX']
+
+      client = storage.Client()
+      bucket = client.bucket(bucket_name)
+      files = [f for f in local_dir.iterdir() if f.is_file()]
+
+      if not files:
+          logger.warning("No files found in '%s'. Nothing to upload.", local_dir)
+      for local_file in files:
+          blob_name = f"{gcs_prefix}/{local_file.name}"
+          blob = bucket.blob(blob_name)
+          logger.info("Uploading '%s' to gs://%s/%s", local_file, bucket_name, blob_name)
+          blob.upload_from_filename(str(local_file))
+          logger.info("Upload complete: gs://%s/%s", bucket_name, blob_name)
 
   # ──────────────────────────────────────────────────────────────────────────
-  # SILVER — Step 3: Run PySpark cleaning job for this date partition
+  # SILVER — Step 3a: Submit PySpark cleaning job to Dataproc (INCREMENTAL)
   # ──────────────────────────────────────────────────────────────────────────
-  - id: silver_spark_job
-    type: io.kestra.plugin.scripts.python.Script
-    description: "Run PySpark Silver job for partition {{ inputs.partition_date }}"
-    env:
-      GOOGLE_APPLICATION_CREDENTIALS: "{{ secret('GCP_SA_KEY_PATH') }}"
-      GCP_PROJECT_ID: "{{ inputs.gcp_project_id }}"
-      GCS_BRONZE_BUCKET: "{{ inputs.gcs_bronze_bucket }}"
-      GCS_SILVER_BUCKET: "{{ inputs.gcs_silver_bucket }}"
-      GCS_ARTIFACTS_BUCKET: "{{ secret('GCS_ARTIFACTS_BUCKET') }}"
-      SPARK_FULL_REFRESH: "{{ inputs.run_mode == 'FULL_REFRESH' }}"
-      PARTITION_DATE: "{{ inputs.partition_date }}"
-    script: |
-      import os, subprocess, sys
-      full_refresh = os.environ.get('SPARK_FULL_REFRESH', 'False').lower() == 'true'
-      partition_date = os.environ['PARTITION_DATE']
-      cmd = [
-          'spark-submit',
-          '--packages', 'com.google.cloud.spark:spark-bigquery-with-dependencies_2.12:0.34.0',
-          '/app/spark/clean_aml_data.py',
-      ]
-      if full_refresh:
-          cmd.append('--full-refresh')
-      else:
-          cmd.extend(['--partition-date', partition_date])
-      result = subprocess.run(cmd, check=True, capture_output=True, text=True)
-      print(result.stdout)
-      if result.stderr:
-          print(result.stderr, file=sys.stderr)
+  - id: silver_spark_dataproc_incremental
+    type: io.kestra.plugin.gcp.dataproc.batches.PySparkSubmit
+    description: "Submit PySpark Silver job to Dataproc Batches for partition {{ inputs.partition_date }} - incremental"
+    runIf: "{{ inputs.run_mode != 'FULL_REFRESH' }}"
+    projectId: "{{ inputs.gcp_project_id }}"
+    region: "{{ inputs.gcp_region }}"
+    name: "aml-silver-incremental-{{ inputs.partition_date }}"
+    serviceAccount: "{{ kv('GCP_SA_EMAIL') }}"
+    mainPythonFileUri: "gs://{{ kv('GCS_ARTIFACTS_BUCKET') }}/spark/clean_aml_data.py"
+    args:
+      - "--partition-date"
+      - "{{ inputs.partition_date }}"
+    jarFileUris:
+      - "gs://spark-lib/bigquery/spark-bigquery-with-dependencies_2.12-0.34.0.jar"
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # SILVER — Step 3b: Submit PySpark cleaning job to Dataproc (FULL_REFRESH)
+  # ──────────────────────────────────────────────────────────────────────────
+  - id: silver_spark_dataproc_full_refresh
+    type: io.kestra.plugin.gcp.dataproc.batches.PySparkSubmit
+    description: "Submit PySpark Silver job to Dataproc Batches - FULL_REFRESH (all partitions)"
+    runIf: "{{ inputs.run_mode == 'FULL_REFRESH' }}"
+    projectId: "{{ inputs.gcp_project_id }}"
+    region: "{{ inputs.gcp_region }}"
+    name: "aml-silver-full-refresh-{{ inputs.partition_date }}"
+    serviceAccount: "{{ kv('GCP_SA_EMAIL') }}"
+    mainPythonFileUri: "gs://{{ kv('GCS_ARTIFACTS_BUCKET') }}/spark/clean_aml_data.py"
+    args:
+      - "--full-refresh"
+      - "--partition-date"
+      - "{{ inputs.partition_date }}"
+    jarFileUris:
+      - "gs://spark-lib/bigquery/spark-bigquery-with-dependencies_2.12-0.34.0.jar"
 
   # ──────────────────────────────────────────────────────────────────────────
   # GOLD — Step 4: Run dbt feature store models (incremental or full-refresh)
@@ -138,9 +196,11 @@ tasks:
   - id: gold_dbt_run
     type: io.kestra.plugin.scripts.shell.Commands
     description: "Run dbt Gold feature store models"
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
     env:
       DBT_PROFILES_DIR: /app/dbt
-      GOOGLE_APPLICATION_CREDENTIALS: "{{ secret('GCP_SA_KEY_PATH') }}"
+      GOOGLE_APPLICATION_CREDENTIALS: "{{ kv('GCP_SA_KEY_PATH') }}"
       GCP_PROJECT_ID: "{{ inputs.gcp_project_id }}"
     commands:
       - |
@@ -159,9 +219,11 @@ tasks:
   - id: gold_dbt_test
     type: io.kestra.plugin.scripts.shell.Commands
     description: "Run dbt tests on Silver and Gold models"
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
     env:
       DBT_PROFILES_DIR: /app/dbt
-      GOOGLE_APPLICATION_CREDENTIALS: "{{ secret('GCP_SA_KEY_PATH') }}"
+      GOOGLE_APPLICATION_CREDENTIALS: "{{ kv('GCP_SA_KEY_PATH') }}"
       GCP_PROJECT_ID: "{{ inputs.gcp_project_id }}"
     commands:
       - |
