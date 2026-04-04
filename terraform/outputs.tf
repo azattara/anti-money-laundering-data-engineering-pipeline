@@ -30,10 +30,20 @@ output "bq_gold_dataset" {
 
 output "kestra_url" {
   description = "Kestra UI URL"
-  value       = "http://${google_compute_instance.kestra.network_interface[0].access_config[0].nat_ip}:8080"
+  value       = "http://${google_compute_address.kestra.address}:8080"
 }
 
 output "kestra_service_account" {
   description = "Email da service account do Kestra"
   value       = google_service_account.kestra.email
+}
+
+output "kestra_basic_auth_username_secret_name" {
+  description = "Secret Manager secret name for the Kestra basic auth username"
+  value       = google_secret_manager_secret.kestra_basic_auth_username.secret_id
+}
+
+output "kestra_basic_auth_password_secret_name" {
+  description = "Secret Manager secret name for the Kestra basic auth password"
+  value       = google_secret_manager_secret.kestra_basic_auth_password.secret_id
 }

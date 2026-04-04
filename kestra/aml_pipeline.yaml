@@ -38,7 +38,7 @@ inputs:
 
   - id: gcp_project_id
     type: STRING
-    defaults: janestreet-data-engineering
+    defaults: anti-ml-data-engineering
     description: "GCP Project ID"
 
   - id: gcp_region
@@ -124,7 +124,6 @@ tasks:
     beforeCommands:
       - pip install --quiet google-cloud-storage
     env:
-      GOOGLE_APPLICATION_CREDENTIALS: "{{ kv('GCP_SA_KEY_PATH') }}"
       GCS_BRONZE_BUCKET: "{{ inputs.gcs_bronze_bucket }}"
       DOWNLOAD_DIR: "{{ vars.download_dir }}/{{ inputs.partition_date }}"
       GCS_PREFIX: "{{ vars.gcs_partition_prefix }}"

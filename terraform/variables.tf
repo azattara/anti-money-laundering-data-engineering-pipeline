@@ -61,7 +61,7 @@ variable "bq_gold_dataset" {
 variable "kestra_machine_type" {
   description = "GCE machine type for the Kestra server"
   type        = string
-  default     = "e2-standard-2"
+  default     = "e2-standard-4"
 }
 
 variable "kestra_allowed_cidrs" {
@@ -69,3 +69,22 @@ variable "kestra_allowed_cidrs" {
   type        = list(string)
   default     = ["0.0.0.0/0"]
 }
+
+variable "kestra_basic_auth_enabled" {
+  description = "Enable Kestra basic auth on the VM bootstrap. Disable for recovery scenarios."
+  type        = bool
+  default     = true
+}
+
+variable "kestra_basic_auth_username_secret_name" {
+  description = "Secret Manager secret name that stores the Kestra basic auth username."
+  type        = string
+  default     = "kestra-basic-auth-username"
+}
+
+variable "kestra_basic_auth_password_secret_name" {
+  description = "Secret Manager secret name that stores the Kestra basic auth password."
+  type        = string
+  default     = "kestra-basic-auth-password"
+}
+

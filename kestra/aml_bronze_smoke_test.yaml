@@ -1,0 +1,148 @@
+id: aml_bronze_smoke_test
+namespace: anti_money_laundering
+
+description: |
+  Minimal Bronze smoke test for the IBM AML dataset.
+
+  Scope:
+    1. Download the dataset from Kaggle
+    2. Upload raw files to the Bronze GCS bucket
+
+labels:
+  project: anti-money-laundering
+  env: production
+  layer: bronze
+  test_type: smoke
+
+inputs:
+  - id: kaggle_dataset
+    type: STRING
+    defaults: ealtman2019/ibm-transactions-for-anti-money-laundering-aml
+    description: "Kaggle dataset slug (owner/dataset-name)"
+
+  - id: gcs_bronze_bucket
+    type: STRING
+    defaults: anti-ml-data-engineering-bronze
+    description: "GCS Bronze bucket name"
+
+  - id: partition_date
+    type: STRING
+    defaults: "{{ now() | date('yyyy-MM-dd') }}"
+    description: "Partition to write under partitions/YYYY-MM-DD"
+
+variables:
+  download_dir: /tmp/aml_raw
+  gcs_partition_prefix: "partitions/{{ inputs.partition_date }}"
+
+tasks:
+  - id: bronze_kaggle_download
+    type: io.kestra.plugin.scripts.python.Script
+    description: "Download IBM AML dataset from Kaggle"
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    beforeCommands:
+      - pip install --quiet "kaggle>=1.6"
+    env:
+      KAGGLE_USERNAME: "{{ kv('KAGGLE_USERNAME') }}"
+      KAGGLE_KEY: "{{ kv('KAGGLE_KEY') }}"
+      KAGGLE_DATASET: "{{ inputs.kaggle_dataset }}"
+      DOWNLOAD_DIR: "{{ vars.download_dir }}"
+      PARTITION_DATE: "{{ inputs.partition_date }}"
+    script: |
+      import logging
+      import os
+      import shutil
+      import subprocess
+      import sys
+      import zipfile
+      from pathlib import Path
+
+      logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
+      logger = logging.getLogger(__name__)
+
+      dataset = os.environ['KAGGLE_DATASET']
+      output_dir = Path(os.environ['DOWNLOAD_DIR']) / os.environ['PARTITION_DATE']
+      output_dir.mkdir(parents=True, exist_ok=True)
+
+      kaggle_bin = shutil.which('kaggle') or os.path.expanduser('~/.local/bin/kaggle')
+      if not kaggle_bin:
+          logger.error('kaggle executable was not found after installation')
+          sys.exit(1)
+
+      env = os.environ.copy()
+      env['PATH'] = os.path.expanduser('~/.local/bin') + ':' + env.get('PATH', '')
+
+      cmd = [kaggle_bin, 'datasets', 'download', dataset, '-p', str(output_dir)]
+      logger.info('Running: %s', ' '.join(cmd))
+      result = subprocess.run(cmd, capture_output=True, text=True, env=env)
+      if result.returncode != 0:
+          logger.error('kaggle stdout: %s', result.stdout)
+          logger.error('kaggle stderr: %s', result.stderr)
+          sys.exit(result.returncode)
+
+      for zip_path in output_dir.glob('*.zip'):
+          logger.info("Unzipping '%s'", zip_path)
+          with zipfile.ZipFile(zip_path, 'r') as archive:
+              archive.extractall(output_dir)
+          zip_path.unlink()
+
+      files = sorted(path.name for path in output_dir.iterdir())
+      logger.info('Download complete. Files: %s', files)
+
+  - id: bronze_upload_to_gcs
+    type: io.kestra.plugin.scripts.python.Script
+    description: "Upload downloaded files to GCS Bronze bucket"
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    beforeCommands:
+      - pip install --quiet google-cloud-storage
+    env:
+      GCS_BRONZE_BUCKET: "{{ inputs.gcs_bronze_bucket }}"
+      DOWNLOAD_DIR: "{{ vars.download_dir }}/{{ inputs.partition_date }}"
+      GCS_PREFIX: "{{ vars.gcs_partition_prefix }}"
+    script: |
+      import logging
+      import os
+      import sys
+      from pathlib import Path
+
+      from google.cloud import storage
+
+      logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
+      logger = logging.getLogger(__name__)
+
+      local_dir = Path(os.environ['DOWNLOAD_DIR'])
+      if not local_dir.exists():
+          logger.error("Download directory '%s' does not exist", local_dir)
+          sys.exit(1)
+
+      files = [path for path in local_dir.iterdir() if path.is_file()]
+      if not files:
+          logger.error("No files found in '%s'", local_dir)
+          sys.exit(1)
+
+      bucket_name = os.environ['GCS_BRONZE_BUCKET']
+      gcs_prefix = os.environ['GCS_PREFIX']
+
+      client = storage.Client()
+      bucket = client.bucket(bucket_name)
+
+      for local_file in files:
+          blob_name = f"{gcs_prefix}/{local_file.name}"
+          logger.info("Uploading '%s' to gs://%s/%s", local_file, bucket_name, blob_name)
+          bucket.blob(blob_name).upload_from_filename(str(local_file))
+
+      logger.info('Bronze smoke test upload complete')
+
+  - id: bronze_smoke_success
+    type: io.kestra.plugin.core.log.Log
+    message: |
+      Bronze smoke test completed successfully for partition {{ inputs.partition_date }}.
+      Uploaded files to gs://{{ inputs.gcs_bronze_bucket }}/{{ vars.gcs_partition_prefix }}/
+
+errors:
+  - id: bronze_smoke_failure
+    type: io.kestra.plugin.core.log.Log
+    message: |
+      Bronze smoke test FAILED for partition {{ inputs.partition_date }}.
+      Inspect bronze_kaggle_download and bronze_upload_to_gcs logs.

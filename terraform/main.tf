@@ -13,6 +13,12 @@ provider "google" {
   region  = var.region
 }
 
+resource "google_project_service" "secretmanager" {
+  project            = var.project_id
+  service            = "secretmanager.googleapis.com"
+  disable_on_destroy = false
+}
+
 # ------------------------------------------------------------------ #
 # GCS Buckets                                                          #
 # ------------------------------------------------------------------ #
@@ -76,10 +82,10 @@ resource "google_storage_bucket" "artifacts" {
 # ------------------------------------------------------------------ #
 
 resource "google_bigquery_dataset" "bronze" {
-  dataset_id                  = var.bq_bronze_dataset
-  location                    = var.bq_location
-  delete_contents_on_destroy  = false
-  description                 = "AML Bronze layer — raw ingested data"
+  dataset_id                 = var.bq_bronze_dataset
+  location                   = var.bq_location
+  delete_contents_on_destroy = false
+  description                = "AML Bronze layer — raw ingested data"
 
   labels = {
     layer   = "bronze"
@@ -88,10 +94,10 @@ resource "google_bigquery_dataset" "bronze" {
 }
 
 resource "google_bigquery_dataset" "silver" {
-  dataset_id                  = var.bq_silver_dataset
-  location                    = var.bq_location
-  delete_contents_on_destroy  = false
-  description                 = "AML Silver layer — cleaned and validated data (PySpark)"
+  dataset_id                 = var.bq_silver_dataset
+  location                   = var.bq_location
+  delete_contents_on_destroy = false
+  description                = "AML Silver layer — cleaned and validated data (PySpark)"
 
   labels = {
     layer   = "silver"
@@ -100,10 +106,10 @@ resource "google_bigquery_dataset" "silver" {
 }
 
 resource "google_bigquery_dataset" "gold" {
-  dataset_id                  = var.bq_gold_dataset
-  location                    = var.bq_location
-  delete_contents_on_destroy  = false
-  description                 = "AML Gold layer — aggregated and modelled data (dbt)"
+  dataset_id                 = var.bq_gold_dataset
+  location                   = var.bq_location
+  delete_contents_on_destroy = false
+  description                = "AML Gold layer — aggregated and modelled data (dbt)"
 
   labels = {
     layer   = "gold"
@@ -133,6 +139,40 @@ resource "google_project_iam_member" "kestra_bigquery" {
   member  = "serviceAccount:${google_service_account.kestra.email}"
 }
 
+resource "google_secret_manager_secret" "kestra_basic_auth_username" {
+  secret_id = var.kestra_basic_auth_username_secret_name
+
+  depends_on = [google_project_service.secretmanager]
+
+  replication {
+    auto {}
+  }
+}
+
+resource "google_secret_manager_secret" "kestra_basic_auth_password" {
+  secret_id = var.kestra_basic_auth_password_secret_name
+
+  depends_on = [google_project_service.secretmanager]
+
+  replication {
+    auto {}
+  }
+}
+
+resource "google_secret_manager_secret_iam_member" "kestra_basic_auth_username_accessor" {
+  project   = var.project_id
+  secret_id = google_secret_manager_secret.kestra_basic_auth_username.secret_id
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${google_service_account.kestra.email}"
+}
+
+resource "google_secret_manager_secret_iam_member" "kestra_basic_auth_password_accessor" {
+  project   = var.project_id
+  secret_id = google_secret_manager_secret.kestra_basic_auth_password.secret_id
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${google_service_account.kestra.email}"
+}
+
 # ------------------------------------------------------------------ #
 # Kestra — Firewall                                                    #
 # ------------------------------------------------------------------ #
@@ -150,6 +190,11 @@ resource "google_compute_firewall" "kestra" {
   target_tags   = ["kestra"]
 
   description = "Allow access to Kestra UI on port 8080"
+}
+
+resource "google_compute_address" "kestra" {
+  name   = "kestra-public-ip"
+  region = var.region
 }
 
 # ------------------------------------------------------------------ #
@@ -173,7 +218,9 @@ resource "google_compute_instance" "kestra" {
 
   network_interface {
     network = "default"
-    access_config {}
+    access_config {
+      nat_ip = google_compute_address.kestra.address
+    }
   }
 
   service_account {
@@ -182,8 +229,15 @@ resource "google_compute_instance" "kestra" {
   }
 
   metadata = {
-    startup-script = "#!/bin/bash\nset -e\ncurl -fsSL https://get.docker.com | sh\ndocker rm -f kestra 2>/dev/null || true\ndocker run -d --name kestra --restart unless-stopped -p 8080:8080 -v /var/kestra/data:/app/storage -e KESTRA_CONFIGURATION='datasources:\\n  h2:\\n    url: jdbc:h2:file:/app/storage/kestra;DB_CLOSE_DELAY=-1;DB_CLOSE_ON_EXIT=false\\n    username: kestra\\n    password: kestra\\n    driverClassName: org.h2.Driver\\nkestra:\\n  repository:\\n    type: h2\\n  queue:\\n    type: h2\\n  storage:\\n    type: local\\n    local:\\n      base-path: /app/storage\\n  tasks:\\n    tmp-dir:\\n      path: /tmp/kestra-wd/tmp\\n' kestra/kestra:latest server standalone\n"
+    serial-port-enable = "TRUE"
   }
+
+  metadata_startup_script = templatefile("${path.module}/kestra_startup.sh.tftpl", {
+    project_id                        = var.project_id
+    kestra_basic_auth_enabled         = var.kestra_basic_auth_enabled
+    kestra_basic_auth_username_secret = var.kestra_basic_auth_username_secret_name
+    kestra_basic_auth_password_secret = var.kestra_basic_auth_password_secret_name
+  })
 
   labels = {
     layer   = "orchestration"
