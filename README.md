@@ -2,6 +2,8 @@
 
 A production-ready **Medallion Architecture** (Bronze / Silver / Gold) data pipeline for the [IBM Transactions for Anti Money Laundering (AML)](https://www.kaggle.com/datasets/ealtman2019/ibm-transactions-for-anti-money-laundering-aml) Kaggle dataset, orchestrated with **Kestra**, processed with **PySpark**, stored on **Google Cloud Storage** and **BigQuery**, and modelled with **dbt**.
 
+The ingestion layer downloads the dataset from Kaggle to a temporary file on disk and **streams each CSV directly to GCS** via the Google Cloud Storage Python client — no persistent local files are kept. The Kestra pipeline then loads the CSVs from GCS into BigQuery (Bronze), runs PySpark for cleaning (Silver), and dbt for feature engineering (Gold).
+
 The **Gold layer is a Feature Store** with temporal feature engineering (rolling windows), incremental materialisation, BigQuery partitioning/clustering, and rule-based feature selection — designed for AML model training and scoring.
 
 ---
@@ -31,10 +33,16 @@ The **Gold layer is a Feature Store** with temporal feature engineering (rolling
 ## Architecture Overview
 
 ```
-┌─────────────┐   ┌───────────────────────────────────────────────────┐
-│  Kaggle API │──▶│  Bronze (GCS — date-partitioned)                  │
-│  IBM AML    │   │  gs://…-bronze/partitions/YYYY-MM-DD/*.csv        │
-└─────────────┘   └───────────────────────┬───────────────────────────┘
+┌─────────────┐   stream to GCS   ┌───────────────────────────────────────────────────┐
+│  Kaggle API │─────────────▶│  Bronze (GCS)                                     │
+│  IBM AML    │  (temp disk)    │  gs://…-bronze/raw/*.csv                       │
+└─────────────┘                 └───────────────────────┬───────────────────────────┘
+                                                    │ Kestra: GCS → BigQuery Load
+                                                    ▼
+                  ┌───────────────────────────────────────────────────┐
+                  │  Bronze (BigQuery)                                │
+                  │  aml_bronze.transactions                          │
+                  └─────────────────────────┬─────────────────────────┘
                                           │ PySpark (incremental)
                                           ▼
                   ┌───────────────────────────────────────────────────┐
@@ -52,6 +60,7 @@ The **Gold layer is a Feature Store** with temporal feature engineering (rolling
                   │  Partition: feature_date  │  Cluster: customer_id │
                   └───────────────────────────────────────────────────┘
 
+Ingestion: kaggle_download.py (Kaggle → temp disk → GCS streaming)
 Orchestration: Kestra (aml_medallion_pipeline flow)
 Infrastructure: Terraform (GCS buckets + BigQuery datasets)
 Manifest/checkpoint: aml_ops.ingestion_manifest (BigQuery)
@@ -64,8 +73,8 @@ Manifest/checkpoint: aml_ops.ingestion_manifest (BigQuery)
 ```
 .
 ├── ingestion/
-│   ├── kaggle_download.py             # Download IBM AML dataset from Kaggle
-│   └── upload_to_gcs.py               # Upload raw files to GCS Bronze bucket
+│   ├── kaggle_download.py             # Download from Kaggle → stream to GCS (no local persistence)
+│   └── upload_to_gcs.py               # Utility: manual upload of local files to GCS
 ├── spark/
 │   └── clean_aml_data.py              # PySpark Silver layer (incremental)
 ├── kestra/
@@ -145,10 +154,9 @@ Windows are implemented with a reusable dbt macro (`macros/rolling_window.sql`) 
 
 ### Bronze → Silver (PySpark)
 
-- Bronze files are uploaded to GCS under **date-partitioned prefixes**:
-  ```
-  gs://<bronze-bucket>/partitions/YYYY-MM-DD/*.csv
-  ```
+- Raw CSV files are stored in GCS under `gs://<bronze-bucket>/raw/` (full-refresh) or `gs://<bronze-bucket>/partitions/YYYY-MM-DD/` (incremental).
+- The ingestion script (`ingestion/kaggle_download.py`) downloads the Kaggle zip to a temporary file on disk, then **streams each CSV directly to GCS** via `blob.upload_from_file()` — no persistent local files are kept. The temp zip is deleted automatically.
+- The Kestra pipeline starts by loading CSVs from GCS into BigQuery (`aml_bronze.transactions`) using a BigQuery Load Job.
 - The Spark job (`spark/clean_aml_data.py`) accepts `--partition-date YYYY-MM-DD` and processes only that prefix.
 - A **manifest table** (`aml_ops.ingestion_manifest`) in BigQuery records each successfully processed partition, preventing double-processing.
 - Kestra passes `inputs.partition_date` (defaulting to yesterday) to the Spark job at runtime.
@@ -327,8 +335,8 @@ Open [http://localhost:8080](http://localhost:8080) and import the flow:
 2. Paste or upload `kestra/aml_pipeline.yaml`.
 
 Configure secrets in Kestra UI (**Settings → Secrets**):
-- `KAGGLE_USERNAME`, `KAGGLE_KEY`
 - `GCP_SA_KEY_PATH`
+- `GCP_SA_EMAIL`
 - `GCS_ARTIFACTS_BUCKET`
 
 ---
@@ -343,14 +351,21 @@ Configure secrets in Kestra UI (**Settings → Secrets**):
    - `partition_date`: `YYYY-MM-DD` (default: yesterday)
    - `run_mode`: `INCREMENTAL` or `FULL_REFRESH`
 
+> **Pre-requisite**: Upload CSVs to GCS before running the pipeline (see step 1 below).
+> The Kestra pipeline starts from GCS → BigQuery (it does **not** download from Kaggle).
+
 ### Manually (step by step)
 
 ```bash
-# 1. Download from Kaggle
+# 1. Download from Kaggle and stream directly to GCS Bronze bucket
+#    (downloads zip to temp file on disk, streams each CSV to GCS, deletes temp)
 python ingestion/kaggle_download.py
 
-# 2. Upload to GCS
-python ingestion/upload_to_gcs.py
+# 2. Load CSVs from GCS into BigQuery Bronze (done automatically by Kestra,
+#    or manually via bq CLI):
+bq load --source_format=CSV --autodetect --skip_leading_rows=1 \
+  anti-ml-data-engineering:aml_bronze.transactions \
+  'gs://anti-ml-data-engineering-bronze/raw/*.csv'
 
 # 3. Run Spark Silver job (incremental for a specific date)
 spark-submit \
