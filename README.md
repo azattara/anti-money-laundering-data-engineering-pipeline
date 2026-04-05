@@ -68,6 +68,60 @@ Manifest/checkpoint: aml_ops.ingestion_manifest (BigQuery)
 
 ---
 
+## Pipeline Topology (Kestra)
+
+The `aml_medallion_pipeline` flow orchestrates five sequential tasks with an error handler. Below is the DAG as rendered by Kestra:
+
+```
+                 ┌──────────────────────┐
+                 │  bronze_gcs_to_bq    │  Step 1 — Load CSV from GCS → BigQuery
+                 │  (Python Script)     │  aml_bronze.transactions
+                 └──────────┬───────────┘
+                            │
+                 ┌──────────▼───────────┐
+                 │  silver_spark_       │  Step 2a — PySpark via Dataproc Batches
+                 │  dataproc_incremental│  Processes single partition_date
+                 └──────────┬───────────┘
+                            │
+                 ┌──────────▼───────────┐
+                 │  silver_spark_       │  Step 2b — PySpark via Dataproc Batches
+                 │  dataproc_full_      │  Full refresh (all partitions)
+                 │  refresh             │
+                 └──────────┬───────────┘
+                            │
+                 ┌──────────▼───────────┐
+                 │  gold_dbt_run        │  Step 3 — dbt run (feature models)
+                 │  (Shell Commands)    │  fct_transactions_silver →
+                 │                      │  mart_customer_features_gold →
+                 │                      │  feature_store_customer_features
+                 └──────────┬───────────┘
+                            │
+                 ┌──────────▼───────────┐
+                 │  gold_dbt_test       │  Step 4 — dbt test (data quality)
+                 │  (Shell Commands)    │  Schema + custom tests on Gold models
+                 └──────────────────────┘
+
+          ┌────────────────────────────────┐
+          │  notify_on_failure (error)     │  Logs failure details if any task
+          │  (Log)                         │  in the pipeline fails
+          └────────────────────────────────┘
+```
+
+| Task | Plugin | Layer | Description |
+|---|---|---|---|
+| `bronze_gcs_to_bq` | `scripts.python.Script` | Bronze | Loads `gs://<bucket>/raw/*.csv` (or `partitions/<date>`) into BigQuery via `LoadJobConfig` |
+| `silver_spark_dataproc_incremental` | `gcp.dataproc.batches.PySparkSubmit` | Silver | Submits `clean_aml_data.py` to Dataproc Serverless for a single partition |
+| `silver_spark_dataproc_full_refresh` | `gcp.dataproc.batches.PySparkSubmit` | Silver | Submits `clean_aml_data.py --full-refresh` to Dataproc Serverless |
+| `gold_dbt_run` | `scripts.shell.Commands` | Gold | Runs `dbt run` on Silver → Gold models (incremental or `--full-refresh`) |
+| `gold_dbt_test` | `scripts.shell.Commands` | Gold | Runs `dbt test` on Silver and Gold models |
+| `notify_on_failure` | `core.log.Log` | — | Error handler: logs partition and run mode on failure |
+
+**Execution modes** (set via `run_mode` input):
+- **`INCREMENTAL`** — Loads only `partitions/<date>/*.csv`, PySpark processes one partition, dbt merges 90-day window
+- **`FULL_REFRESH`** — Loads all `raw/*.csv` with `WRITE_TRUNCATE`, PySpark reprocesses everything, dbt runs `--full-refresh`
+
+---
+
 ## Project Structure
 
 ```
