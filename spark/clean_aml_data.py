@@ -206,18 +206,40 @@ def write_silver(
     write_mode: str = "append",
     gcs_mode: str = "append",
 ) -> None:
-    """Write cleaned data to BigQuery Silver table and GCS Silver bucket."""
+    """Write cleaned data to BigQuery Silver table and GCS Silver bucket.
+
+    BigQuery table is partitioned by DAY on the ``timestamp`` column and
+    clustered by ``from_id, to_id`` to optimise time-range scans and
+    account-level lookups — critical for AML query patterns.
+    """
     row_count = df.count()
     logger.info("Writing %d rows to BigQuery table: %s (mode=%s)", row_count, BQ_TABLE, write_mode)
-    (
+
+    ts_col = _resolve_column(df, ["timestamp", "date_time", "transaction_date"])
+    from_col = _resolve_column(df, ["from_id", "from_account", "fromid"])
+    to_col = _resolve_column(df, ["to_id", "to_account", "toid"])
+
+    writer = (
         df.write.format("bigquery")
         .option("table", BQ_TABLE)
         .option("temporaryGcsBucket", TEMP_GCS_BUCKET)
         .option("createDisposition", "CREATE_IF_NEEDED")
         .option("writeDisposition", f"WRITE_{write_mode.upper()}")
-        .save()
     )
-    logger.info("BigQuery write complete.")
+
+    if ts_col:
+        writer = (
+            writer
+            .option("partitionField", ts_col)
+            .option("partitionType", "DAY")
+        )
+
+    cluster_cols = [c for c in [from_col, to_col] if c]
+    if cluster_cols:
+        writer = writer.option("clusteredFields", ",".join(cluster_cols))
+
+    writer.save()
+    logger.info("BigQuery write complete (partitioned=%s, clustered=%s).", ts_col, cluster_cols)
 
     logger.info("Writing to GCS Silver path: %s (mode=%s)", SILVER_GCS_PATH, gcs_mode)
     df.write.mode(gcs_mode).parquet(SILVER_GCS_PATH)
