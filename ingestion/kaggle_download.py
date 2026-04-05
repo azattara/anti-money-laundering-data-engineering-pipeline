@@ -9,6 +9,10 @@ issues with large datasets. Each CSV inside the archive is then extracted and
 streamed directly to GCS via blob.upload_from_file(). The temp file is deleted
 automatically when done.
 
+Resumable: files already present in GCS (matching name and size) are skipped,
+so the script can be safely re-run after a failure without re-uploading
+everything. Large files use resumable uploads with retry.
+
 Environment variables:
   - KAGGLE_USERNAME / KAGGLE_KEY  — Kaggle API credentials
   - GCS_BRONZE_BUCKET             — Target GCS bucket (default: anti-ml-data-engineering-bronze)
@@ -86,6 +90,7 @@ def download_and_stream_to_gcs(
         gcs_client = storage.Client()
         bucket = gcs_client.bucket(bucket_name)
         uploaded = 0
+        skipped = 0
 
         with zipfile.ZipFile(zip_path) as zf:
             entries = [e for e in zf.infolist() if not e.is_dir()]
@@ -94,13 +99,27 @@ def download_and_stream_to_gcs(
             for i, entry in enumerate(entries, 1):
                 blob_name = f"{gcs_prefix}/{entry.filename}"
                 blob = bucket.blob(blob_name)
+
+                # Skip files already uploaded (matching name and size)
+                if blob.exists():
+                    blob.reload()
+                    if blob.size == entry.file_size:
+                        logger.info("[%d/%d] SKIP '%s' (already in GCS, %.1f MB)",
+                                    i, len(entries), entry.filename, blob.size / 1e6)
+                        skipped += 1
+                        continue
+
                 with zf.open(entry) as src:
                     logger.info("[%d/%d] Streaming '%s' (%.1f MB) → gs://%s/%s",
                                 i, len(entries), entry.filename, entry.file_size / 1e6, bucket_name, blob_name)
-                    blob.upload_from_file(src, content_type="text/csv")
+                    blob.upload_from_file(
+                        src,
+                        content_type="text/csv",
+                        timeout=3600,
+                    )
                 uploaded += 1
 
-        logger.info("Done — %d file(s) streamed to gs://%s/%s/", uploaded, bucket_name, gcs_prefix)
+        logger.info("Done — %d uploaded, %d skipped → gs://%s/%s/", uploaded, skipped, bucket_name, gcs_prefix)
     finally:
         os.unlink(zip_path)
         logger.info("Temp file deleted: %s", zip_path)
