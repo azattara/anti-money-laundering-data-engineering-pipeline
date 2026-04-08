@@ -19,6 +19,12 @@ resource "google_project_service" "secretmanager" {
   disable_on_destroy = false
 }
 
+resource "google_project_service" "dataproc" {
+  project            = var.project_id
+  service            = "dataproc.googleapis.com"
+  disable_on_destroy = false
+}
+
 # ------------------------------------------------------------------ #
 # GCS Buckets                                                          #
 # ------------------------------------------------------------------ #
@@ -137,6 +143,42 @@ resource "google_project_iam_member" "kestra_bigquery" {
   project = var.project_id
   role    = "roles/bigquery.admin"
   member  = "serviceAccount:${google_service_account.kestra.email}"
+}
+
+resource "google_project_iam_member" "kestra_dataproc" {
+  project = var.project_id
+  role    = "roles/dataproc.admin"
+  member  = "serviceAccount:${google_service_account.kestra.email}"
+}
+
+resource "google_project_iam_member" "kestra_sa_user" {
+  project = var.project_id
+  role    = "roles/iam.serviceAccountUser"
+  member  = "serviceAccount:${google_service_account.kestra.email}"
+}
+
+# Default Compute Engine SA needs Dataproc Worker role for Serverless Batches workers
+resource "google_project_iam_member" "compute_default_dataproc_worker" {
+  project = var.project_id
+  role    = "roles/dataproc.worker"
+  member  = "serviceAccount:${data.google_project.project.number}-compute@developer.gserviceaccount.com"
+}
+
+# Default Compute Engine SA needs BigQuery access for Spark BigQuery connector
+resource "google_project_iam_member" "compute_default_bigquery_data_editor" {
+  project = var.project_id
+  role    = "roles/bigquery.dataEditor"
+  member  = "serviceAccount:${data.google_project.project.number}-compute@developer.gserviceaccount.com"
+}
+
+resource "google_project_iam_member" "compute_default_bigquery_job_user" {
+  project = var.project_id
+  role    = "roles/bigquery.jobUser"
+  member  = "serviceAccount:${data.google_project.project.number}-compute@developer.gserviceaccount.com"
+}
+
+data "google_project" "project" {
+  project_id = var.project_id
 }
 
 resource "google_secret_manager_secret" "kestra_basic_auth_username" {

@@ -34,6 +34,33 @@ if [ "${kestra_basic_auth_enabled}" = "true" ]; then
   KESTRA_BASIC_AUTH_PASSWORD=$(fetch_secret "${project_id}" "${kestra_basic_auth_password_secret}")
 fi
 
+if [ "${kestra_basic_auth_enabled}" = "true" ] && [ -n "$${KESTRA_BASIC_AUTH_USERNAME:-}" ]; then
+cat >/tmp/kestra-config.yml <<EOF
+datasources:
+  h2:
+    url: "jdbc:h2:/opt/kestra/db/db;DB_CLOSE_DELAY=-1;DB_CLOSE_ON_EXIT=FALSE"
+    driverClassName: org.h2.Driver
+    username: sa
+    password: ""
+kestra:
+  repository:
+    type: h2
+  queue:
+    type: h2
+  storage:
+    type: local
+    local:
+      base-path: /opt/kestra/storage
+  tasks:
+    tmp-dir:
+      path: /tmp/kestra-wd/tmp
+  server:
+    basic-auth:
+      enabled: true
+      username: $${KESTRA_BASIC_AUTH_USERNAME}
+      password: $${KESTRA_BASIC_AUTH_PASSWORD}
+EOF
+else
 cat >/tmp/kestra-config.yml <<EOF
 datasources:
   h2:
@@ -60,6 +87,7 @@ micronaut:
   security:
     enabled: false
 EOF
+fi
 
 docker run -d \
   --name kestra \

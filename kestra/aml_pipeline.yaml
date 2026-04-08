@@ -35,6 +35,11 @@ inputs:
     defaults: anti-ml-data-engineering-silver
     description: "GCS Silver bucket name"
 
+  - id: gcs_artifacts_bucket
+    type: STRING
+    defaults: anti-ml-data-engineering-artifacts
+    description: "GCS Artifacts bucket name (contains Spark scripts)"
+
   - id: gcp_project_id
     type: STRING
     defaults: anti-ml-data-engineering
@@ -52,7 +57,7 @@ inputs:
 
   - id: run_mode
     type: STRING
-    defaults: INCREMENTAL
+    defaults: FULL_REFRESH
     description: "INCREMENTAL or FULL_REFRESH"
 
 variables:
@@ -69,7 +74,7 @@ tasks:
     taskRunner:
       type: io.kestra.plugin.core.runner.Process
     beforeCommands:
-      - pip install --quiet google-cloud-bigquery
+      - pip install --quiet google-cloud-bigquery google-cloud-storage
     env:
       GCP_PROJECT_ID: "{{ inputs.gcp_project_id }}"
       GCS_BRONZE_BUCKET: "{{ inputs.gcs_bronze_bucket }}"
@@ -78,7 +83,7 @@ tasks:
       GOOGLE_APPLICATION_CREDENTIALS: "{{ kv('GCP_SA_KEY_PATH') }}"
     script: |
       import os, logging
-      from google.cloud import bigquery
+      from google.cloud import bigquery, storage
 
       logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
       logger = logging.getLogger(__name__)
@@ -88,66 +93,180 @@ tasks:
       prefix     = os.environ['GCS_PREFIX']
       run_mode   = os.environ['RUN_MODE']
       table_id   = f"{project_id}.aml_bronze.transactions"
-      source_uri = f"gs://{bucket}/{prefix}/*.csv"
 
-      write_disp = (
-          bigquery.WriteDisposition.WRITE_TRUNCATE
-          if run_mode == 'FULL_REFRESH'
-          else bigquery.WriteDisposition.WRITE_APPEND
-      )
+      bq_client  = bigquery.Client(project=project_id)
+      gcs_client = storage.Client(project=project_id)
 
-      client = bigquery.Client(project=project_id)
-      job_config = bigquery.LoadJobConfig(
-          source_format=bigquery.SourceFormat.CSV,
-          skip_leading_rows=1,
-          autodetect=True,
-          write_disposition=write_disp,
-          create_disposition=bigquery.CreateDisposition.CREATE_IF_NEEDED,
-      )
+      # IBM AML CSVs have duplicate "Account" headers (from/to).
+      # Use explicit schema to rename them.
+      TRANSACTION_SCHEMA = [
+          bigquery.SchemaField("timestamp",          "STRING"),
+          bigquery.SchemaField("from_bank",           "STRING"),
+          bigquery.SchemaField("from_id",             "STRING"),
+          bigquery.SchemaField("to_bank",             "STRING"),
+          bigquery.SchemaField("to_id",               "STRING"),
+          bigquery.SchemaField("amount_received",     "FLOAT64"),
+          bigquery.SchemaField("receiving_currency",  "STRING"),
+          bigquery.SchemaField("amount_paid",         "FLOAT64"),
+          bigquery.SchemaField("payment_currency",    "STRING"),
+          bigquery.SchemaField("payment_format",      "STRING"),
+          bigquery.SchemaField("is_laundering",       "INTEGER"),
+      ]
 
-      logger.info("Loading from %s → %s (mode: %s)", source_uri, table_id, run_mode)
-      load_job = client.load_table_from_uri(source_uri, table_id, job_config=job_config)
-      load_job.result()
+      # Only load transaction files (*Trans.csv)
+      blobs = [
+          b for b in gcs_client.list_blobs(bucket, prefix=prefix + "/")
+          if b.name.endswith(".csv") and "Trans" in b.name
+      ]
+      logger.info("Found %d Trans CSV files in gs://%s/%s/", len(blobs), bucket, prefix)
 
-      table = client.get_table(table_id)
+      if not blobs:
+          raise RuntimeError(f"No Trans CSV files found in gs://{bucket}/{prefix}/")
+
+      first = True
+      for blob in blobs:
+          uri = f"gs://{bucket}/{blob.name}"
+          if first and run_mode == 'FULL_REFRESH':
+              write_disp = bigquery.WriteDisposition.WRITE_TRUNCATE
+              first = False
+          else:
+              write_disp = bigquery.WriteDisposition.WRITE_APPEND
+
+          job_config = bigquery.LoadJobConfig(
+              source_format=bigquery.SourceFormat.CSV,
+              skip_leading_rows=1,
+              schema=TRANSACTION_SCHEMA,
+              write_disposition=write_disp,
+              create_disposition=bigquery.CreateDisposition.CREATE_IF_NEEDED,
+          )
+          if write_disp == bigquery.WriteDisposition.WRITE_APPEND:
+              job_config.schema_update_options = [
+                  bigquery.SchemaUpdateOption.ALLOW_FIELD_ADDITION,
+              ]
+
+          logger.info("Loading %s → %s (%s)", uri, table_id, write_disp)
+          load_job = bq_client.load_table_from_uri(uri, table_id, job_config=job_config)
+          load_job.result()
+          logger.info("  Loaded %s OK", blob.name)
+
+      table = bq_client.get_table(table_id)
       logger.info("Load complete. Table '%s' now has %d rows.", table_id, table.num_rows)
 
   # ──────────────────────────────────────────────────────────────────────────
   # SILVER — Step 2a: Submit PySpark cleaning job to Dataproc (INCREMENTAL)
   # ──────────────────────────────────────────────────────────────────────────
   - id: silver_spark_dataproc_incremental
-    type: io.kestra.plugin.gcp.dataproc.batches.PySparkSubmit
+    type: io.kestra.plugin.scripts.python.Script
     description: "Submit PySpark Silver job to Dataproc Batches for partition {{ inputs.partition_date }} — incremental"
     runIf: "{{ inputs.run_mode != 'FULL_REFRESH' }}"
-    projectId: "{{ inputs.gcp_project_id }}"
-    region: "{{ inputs.gcp_region }}"
-    name: "aml-silver-incremental-{{ inputs.partition_date }}"
-    serviceAccount: "{{ kv('GCP_SA_EMAIL') }}"
-    mainPythonFileUri: "gs://{{ kv('GCS_ARTIFACTS_BUCKET') }}/spark/clean_aml_data.py"
-    args:
-      - "--partition-date"
-      - "{{ inputs.partition_date }}"
-    jarFileUris:
-      - "gs://spark-lib/bigquery/spark-bigquery-with-dependencies_2.12-0.34.0.jar"
+    timeout: PT2H
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    beforeCommands:
+      - pip install --quiet google-cloud-dataproc
+    env:
+      GOOGLE_APPLICATION_CREDENTIALS: "{{ kv('GCP_SA_KEY_PATH') }}"
+      GCP_PROJECT_ID: "{{ inputs.gcp_project_id }}"
+      GCP_REGION: "{{ inputs.gcp_region }}"
+      GCS_ARTIFACTS_BUCKET: "{{ inputs.gcs_artifacts_bucket }}"
+      PARTITION_DATE: "{{ inputs.partition_date }}"
+      EXECUTION_ID: "{{ execution.id }}"
+    script: |
+      import os, time, logging
+      from google.cloud.dataproc_v1 import BatchControllerClient, Batch
+
+      logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
+      logger = logging.getLogger(__name__)
+
+      project = os.environ['GCP_PROJECT_ID']
+      region = os.environ['GCP_REGION']
+      bucket = os.environ['GCS_ARTIFACTS_BUCKET']
+      partition = os.environ['PARTITION_DATE']
+      exec_id = os.environ['EXECUTION_ID'].lower()
+
+      batch_id = f"aml-silver-inc-{partition}-{exec_id}"
+      parent = f"projects/{project}/locations/{region}"
+
+      batch = Batch()
+      batch.pyspark_batch.main_python_file_uri = f"gs://{bucket}/spark/clean_aml_data.py"
+      batch.pyspark_batch.args = ["--partition-date", partition]
+
+      client = BatchControllerClient(client_options={"api_endpoint": f"{region}-dataproc.googleapis.com:443"})
+      logger.info("Submitting batch %s", batch_id)
+      op = client.create_batch(parent=parent, batch=batch, batch_id=batch_id)
+
+      logger.info("Waiting for batch to complete (polling every 30s)...")
+      while not op.done():
+          time.sleep(30)
+          b = client.get_batch(name=f"{parent}/batches/{batch_id}")
+          logger.info("Batch state: %s", b.state.name)
+          if b.state.name in ("FAILED", "CANCELLED"):
+              raise RuntimeError(f"Batch {batch_id} {b.state.name}: {b.state_message}")
+          if b.state.name == "SUCCEEDED":
+              break
+
+      result = client.get_batch(name=f"{parent}/batches/{batch_id}")
+      if result.state.name != "SUCCEEDED":
+          raise RuntimeError(f"Batch {batch_id} ended with state {result.state.name}: {result.state_message}")
+      logger.info("Batch %s SUCCEEDED", batch_id)
 
   # ──────────────────────────────────────────────────────────────────────────
   # SILVER — Step 2b: Submit PySpark cleaning job to Dataproc (FULL_REFRESH)
   # ──────────────────────────────────────────────────────────────────────────
   - id: silver_spark_dataproc_full_refresh
-    type: io.kestra.plugin.gcp.dataproc.batches.PySparkSubmit
+    type: io.kestra.plugin.scripts.python.Script
     description: "Submit PySpark Silver job to Dataproc Batches — FULL_REFRESH (all partitions)"
     runIf: "{{ inputs.run_mode == 'FULL_REFRESH' }}"
-    projectId: "{{ inputs.gcp_project_id }}"
-    region: "{{ inputs.gcp_region }}"
-    name: "aml-silver-full-refresh-{{ inputs.partition_date }}"
-    serviceAccount: "{{ kv('GCP_SA_EMAIL') }}"
-    mainPythonFileUri: "gs://{{ kv('GCS_ARTIFACTS_BUCKET') }}/spark/clean_aml_data.py"
-    args:
-      - "--full-refresh"
-      - "--partition-date"
-      - "{{ inputs.partition_date }}"
-    jarFileUris:
-      - "gs://spark-lib/bigquery/spark-bigquery-with-dependencies_2.12-0.34.0.jar"
+    timeout: PT2H
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    beforeCommands:
+      - pip install --quiet google-cloud-dataproc
+    env:
+      GOOGLE_APPLICATION_CREDENTIALS: "{{ kv('GCP_SA_KEY_PATH') }}"
+      GCP_PROJECT_ID: "{{ inputs.gcp_project_id }}"
+      GCP_REGION: "{{ inputs.gcp_region }}"
+      GCS_ARTIFACTS_BUCKET: "{{ inputs.gcs_artifacts_bucket }}"
+      PARTITION_DATE: "{{ inputs.partition_date }}"
+      EXECUTION_ID: "{{ execution.id }}"
+    script: |
+      import os, time, logging
+      from google.cloud.dataproc_v1 import BatchControllerClient, Batch
+
+      logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
+      logger = logging.getLogger(__name__)
+
+      project = os.environ['GCP_PROJECT_ID']
+      region = os.environ['GCP_REGION']
+      bucket = os.environ['GCS_ARTIFACTS_BUCKET']
+      partition = os.environ['PARTITION_DATE']
+      exec_id = os.environ['EXECUTION_ID'].lower()
+
+      batch_id = f"aml-silver-full-{partition}-{exec_id}"
+      parent = f"projects/{project}/locations/{region}"
+
+      batch = Batch()
+      batch.pyspark_batch.main_python_file_uri = f"gs://{bucket}/spark/clean_aml_data.py"
+      batch.pyspark_batch.args = ["--full-refresh"]
+
+      client = BatchControllerClient(client_options={"api_endpoint": f"{region}-dataproc.googleapis.com:443"})
+      logger.info("Submitting batch %s", batch_id)
+      op = client.create_batch(parent=parent, batch=batch, batch_id=batch_id)
+
+      logger.info("Waiting for batch to complete (polling every 30s)...")
+      while not op.done():
+          time.sleep(30)
+          b = client.get_batch(name=f"{parent}/batches/{batch_id}")
+          logger.info("Batch state: %s", b.state.name)
+          if b.state.name in ("FAILED", "CANCELLED"):
+              raise RuntimeError(f"Batch {batch_id} {b.state.name}: {b.state_message}")
+          if b.state.name == "SUCCEEDED":
+              break
+
+      result = client.get_batch(name=f"{parent}/batches/{batch_id}")
+      if result.state.name != "SUCCEEDED":
+          raise RuntimeError(f"Batch {batch_id} ended with state {result.state.name}: {result.state_message}")
+      logger.info("Batch %s SUCCEEDED", batch_id)
 
   # ──────────────────────────────────────────────────────────────────────────
   # GOLD — Step 3: Run dbt feature store models (incremental or full-refresh)
