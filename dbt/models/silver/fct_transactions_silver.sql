@@ -5,8 +5,14 @@
 
 {{ config(
     materialized='table',
-    schema='aml_silver'
+    partition_by={
+      "field": "feature_date",
+      "data_type": "date"
+    },
+    cluster_by=["customer_id", "payment_format"]
 ) }}
+
+
 
 with source as (
     select * from {{ source('aml_silver', 'transactions') }}
@@ -15,26 +21,25 @@ with source as (
 deduplicated as (
     select
         *,
+        date(cast(timestamp as timestamp)) as feature_date, 
         row_number() over (
-            partition by from_id, to_id, amount, timestamp
+            partition by account2, account4, cast(amount_received as string), timestamp 
             order by _ingested_at desc
         ) as _row_num
     from source
     where
-        amount > 0
-        and from_id is not null
-        and to_id   is not null
+        amount_received > 0 
+        and account2 is not null
+        and account4 is not null
         and timestamp is not null
 ),
-
 cleaned as (
     select
         -- Primary identifiers
-        cast(from_id   as string) as customer_id,
-        cast(to_id     as string) as counterparty_id,
-
+        cast(account2    as string) as customer_id,
+        cast(account4      as string) as counterparty_id,
         -- Transaction facts
-        cast(amount    as float64)                  as amount,
+        cast(amount_received    as float64)                  as amount,
         cast(timestamp as timestamp)                as event_time,
         date(cast(timestamp as timestamp))          as feature_date,
 

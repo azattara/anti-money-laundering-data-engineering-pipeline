@@ -1,11 +1,18 @@
--- models/silver/stg_transactions_silver.sql
--- Silver layer: cleaned and validated transactions (output of PySpark job)
--- Adds a row_number for deduplication safety and filters out invalid amounts.
-
 {{ config(materialized='table', schema='aml_silver') }}
 
 select
     *,
-    row_number() over (partition by from_id, to_id, amount, timestamp order by _ingested_at desc) as row_num
+    row_number() over (
+        partition by 
+            from_bank, 
+            account2, 
+            to_bank, 
+            account4, 
+            cast(amount_paid as string), 
+            timestamp 
+        order by _ingested_at desc
+    ) as row_num
 from {{ source('aml_silver', 'transactions') }}
-where amount > 0
+where amount_paid > 0
+
+
