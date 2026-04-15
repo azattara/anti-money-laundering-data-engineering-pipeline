@@ -38,15 +38,21 @@ models:
   - name: fct_transactions_silver
     description: >
       Canonical Silver fact table: one row per unique transaction.
-      Cleaned, deduplicated, fully typed.  This is the single source of truth
+      Cleaned, deduplicated, fully typed.  Incrementally materialized via
+      merge on transaction_key.  This is the single source of truth
       for all Gold / feature-store models.
     columns:
+      - name: transaction_key
+        description: "MD5 surrogate key (account2|account4|amount_received|timestamp) — merge key for incremental"
+        tests:
+          - not_null
+          - unique
       - name: customer_id
-        description: "Sending customer identifier (from_id cast to STRING)"
+        description: "Sending customer identifier (account2 cast to STRING)"
         tests:
           - not_null
       - name: counterparty_id
-        description: "Receiving counterparty identifier (to_id cast to STRING)"
+        description: "Receiving counterparty identifier (account4 cast to STRING)"
         tests:
           - not_null
       - name: amount
@@ -75,9 +81,32 @@ models:
   # ── Gold / Feature Store ────────────────────────────────────────────────────
   - name: mart_transactions_gold
     description: >
-      Legacy Gold aggregation at sender-receiver pair level.
-      Kept for backwards compatibility; canonical feature store is
-      mart_customer_features_gold → feature_store_customer_features.
+      Gold layer: aggregated transaction summary per sender-receiver pair.
+      Grain: (customer_id, counterparty_id). Incrementally materialized with
+      90-day lookback, merged on unique pair key.
+    columns:
+      - name: customer_id
+        description: "Sending customer identifier"
+        tests:
+          - not_null
+      - name: counterparty_id
+        description: "Receiving counterparty identifier"
+        tests:
+          - not_null
+      - name: transaction_count
+        description: "Total number of transactions between the pair"
+      - name: total_amount
+        description: "Sum of all transaction amounts"
+      - name: avg_amount
+        description: "Average transaction amount"
+      - name: min_amount
+        description: "Minimum transaction amount"
+      - name: max_amount
+        description: "Maximum transaction amount"
+      - name: first_transaction_at
+        description: "Earliest transaction timestamp"
+      - name: last_transaction_at
+        description: "Latest transaction timestamp"
 
   - name: mart_customer_features_gold
     description: >

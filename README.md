@@ -18,15 +18,16 @@ The **Gold layer is a Feature Store** with temporal feature engineering (rolling
 6. [90-Day Lookback and Implications](#90-day-lookback-and-implications)
 7. [BigQuery Partitioning & Clustering](#bigquery-partitioning--clustering)
 8. [Feature Selection (Rule-Based)](#feature-selection-rule-based)
-9. [Prerequisites](#prerequisites)
-10. [Kaggle Token Setup](#kaggle-token-setup)
-11. [GCP Authentication](#gcp-authentication)
-12. [Provisioning Infrastructure (Terraform)](#provisioning-infrastructure-terraform)
-13. [Starting Kestra (Docker Compose)](#starting-kestra-docker-compose)
-14. [Running the Pipeline](#running-the-pipeline)
-15. [Running dbt Incrementally](#running-dbt-incrementally)
-16. [dbt Model Reference](#dbt-model-reference)
-17. [Adding / Removing Features](#adding--removing-features)
+9. [Dimensionality per Layer & Quality Rules](#dimensionality-per-layer--quality-rules)
+10. [Prerequisites](#prerequisites)
+11. [Kaggle Token Setup](#kaggle-token-setup)
+12. [GCP Authentication](#gcp-authentication)
+13. [Provisioning Infrastructure (Terraform)](#provisioning-infrastructure-terraform)
+14. [Starting Kestra (Docker Compose)](#starting-kestra-docker-compose)
+15. [Running the Pipeline](#running-the-pipeline)
+16. [Running dbt Incrementally](#running-dbt-incrementally)
+17. [dbt Model Reference](#dbt-model-reference)
+18. [Adding / Removing Features](#adding--removing-features)
 
 ---
 
@@ -313,6 +314,105 @@ The `feature_store_customer_features` model is the **selection layer** — it ap
 
 ---
 
+## Dimensionality per Layer & Quality Rules
+
+This section documents the schema (columns) of each layer, the grain, and the quality rules applied at every stage of the pipeline. Controlling dimensionality is critical for downstream ML — excessive features cause the **Curse of Dimensionality** (sparse data, overfitting, increased compute cost) while too few features lose predictive signal.
+
+### Bronze — Raw Source
+
+| Property | Value |
+|---|---|
+| **Table** | `aml_bronze.transactions` |
+| **Grain** | One row per raw CSV record (no deduplication) |
+| **Materialization** | `view` (dbt) / BigQuery Load Job (Kestra) |
+| **Columns** | All original Kaggle columns as-is (no transformations) |
+| **Quality rules** | None — this layer is an immutable landing zone |
+
+### Silver — Cleaned & Typed
+
+| Property | Value |
+|---|---|
+| **Table** | `aml_silver.fct_transactions_silver` |
+| **Grain** | One row per unique transaction (`transaction_key` = MD5 of natural key) |
+| **Materialization** | `incremental` (merge on `transaction_key`) |
+| **Columns (11)** | `transaction_key`, `customer_id`, `counterparty_id`, `amount`, `event_time`, `feature_date`, `is_laundering`, `payment_format`, `payment_currency`, `receiving_currency`, `_ingested_at` |
+
+**Quality rules applied:**
+
+| Rule | Implementation | Purpose |
+|---|---|---|
+| Null rejection | `WHERE account2 IS NOT NULL AND account4 IS NOT NULL AND timestamp IS NOT NULL` | Drop records missing critical identifiers |
+| Non-positive amounts | `WHERE amount_received > 0` | Remove zero/negative transactions |
+| Deduplication | `ROW_NUMBER() OVER (PARTITION BY account2, account4, amount_received, timestamp ORDER BY _ingested_at DESC)` | Keep only the most recent ingestion of each transaction |
+| Safe defaults | `COALESCE(NULLIF(TRIM(payment_format), ''), 'UNKNOWN')` | Prevent nulls in categorical columns |
+| Explicit type casting | `CAST(amount_received AS FLOAT64)`, `CAST(timestamp AS TIMESTAMP)` | Enforce type safety |
+| Schema tests (dbt) | `not_null` on `transaction_key`, `customer_id`, `counterparty_id`, `amount`, `event_time`, `feature_date`; `unique` on `transaction_key` | Validate constraints on every `dbt test` run |
+
+> **PySpark upstream** (`spark/clean_aml_data.py`) also applies column normalisation, `dropDuplicates()`, null drops on critical fields, positive-amount filter, type casting, and `_ingested_at` metadata — providing defence-in-depth before data reaches dbt.
+
+### Gold — Feature Store (Compute Layer)
+
+| Property | Value |
+|---|---|
+| **Table** | `aml_gold.mart_customer_features_gold` |
+| **Grain** | `(customer_id, feature_date)` — one row per customer per day |
+| **Materialization** | `incremental` (merge, 90-day lookback) |
+| **Columns (~40)** | 1-day raw aggregates + 7/30/90-day rolling windows + derived ratios + metadata |
+
+| Feature group | Columns | Windows |
+|---|---|---|
+| Transaction count | `tx_count_1d`, `tx_count_7d`, `tx_count_30d`, `tx_count_90d` | 1/7/30/90d |
+| Amount sum | `tx_amount_sum_1d`, `tx_amount_sum_7d`, `tx_amount_sum_30d`, `tx_amount_sum_90d` | 1/7/30/90d |
+| Amount avg | `tx_amount_avg_1d`, `tx_amount_avg_7d`, `tx_amount_avg_30d`, `tx_amount_avg_90d` | 1/7/30/90d |
+| Amount max | `tx_amount_max_1d`, `tx_amount_max_7d`, `tx_amount_max_30d`, `tx_amount_max_90d` | 1/7/30/90d |
+| Amount min/std | `tx_amount_min_1d`, `tx_amount_std_1d` | 1d only |
+| Counterparty diversity | `unique_counterparties_1d/7d/30d/90d` | 1/7/30/90d |
+| Cross-currency count | `cross_currency_tx_count_1d/7d/30d/90d` | 1/7/30/90d |
+| Currency diversity | `unique_payment_currencies_1d/30d/90d` | 1/30/90d |
+| Payment format diversity | `unique_payment_formats_1d/90d` | 1/90d |
+| Recency | `days_since_last_tx` | — |
+| Derived ratios | `cross_currency_ratio_30d/90d`, `counterparty_concentration_30d`, `amount_max_to_avg_ratio_7d`, `velocity_spike_ratio_7d` | — |
+| Metadata | `feature_version`, `source_model`, `feature_created_at` | — |
+
+### Gold — Feature Store (Serving Layer)
+
+| Property | Value |
+|---|---|
+| **Table** | `aml_gold.feature_store_customer_features` |
+| **Grain** | `(customer_id, feature_date)` |
+| **Materialization** | `incremental` (merge, 90-day lookback) |
+| **Columns (~25)** | Curated subset published after rule-based selection |
+
+**Feature selection rules — why ~40 columns are reduced to ~25:**
+
+| Rule | Criteria | Action | Example |
+|---|---|---|---|
+| **RULE-1** — Null threshold | Feature null-rate > 30% in cold-start scenarios | Exclude or coalesce to sentinel value | `days_since_last_tx` → `COALESCE(..., -1)` on first active day |
+| **RULE-2** — Low variance | Trivially constant for single-transaction days | Exclude in favour of rolling equivalents | `tx_amount_min_1d`, `tx_amount_std_1d` dropped |
+| **RULE-3** — Redundancy | Highly correlated feature pairs | Keep one representative | `amount_max_to_avg_ratio_7d` captures the max ↔ avg relationship |
+| **RULE-4** — Leakage prevention | Target / label columns | **Never** published | `is_laundering` excluded from all outputs |
+
+> **Why this matters for ML:** Publishing ~25 curated features (instead of ~40 raw ones) reduces the curse of dimensionality, prevents overfitting, speeds up model training, and removes collinear inputs that destabilise linear models — while retaining the key AML signals (RFM, cross-currency, velocity spikes).
+
+### Gold — Transaction Aggregation
+
+| Property | Value |
+|---|---|
+| **Table** | `aml_gold.mart_transactions_gold` |
+| **Grain** | `(customer_id, counterparty_id)` — one row per sender-receiver pair |
+| **Materialization** | `incremental` (merge, 90-day lookback) |
+| **Columns (9)** | `customer_id`, `counterparty_id`, `transaction_count`, `total_amount`, `avg_amount`, `min_amount`, `max_amount`, `first_transaction_at`, `last_transaction_at` |
+
+### Summary: Dimensionality Progression
+
+```
+Bronze (raw)  ──▶  Silver (11 cols)  ──▶  Gold compute (~40 cols)  ──▶  Gold serving (~25 cols)
+   no rules         6 quality rules        rolling-window expansion      4 selection rules
+   all records      deduplicated           (customer_id, date) grain     curated for ML
+```
+
+---
+
 ## Prerequisites
 
 | Tool | Version | Purpose |
@@ -468,8 +568,8 @@ dbt run --select mart_customer_features_gold feature_store_customer_features
 |---|---|---|---|---|
 | `stg_transactions_bronze` | Bronze | transaction | view | Thin passthrough |
 | `stg_transactions_silver` | Silver | transaction | table | Legacy; use `fct_transactions_silver` |
-| `fct_transactions_silver` | Silver | transaction | table | Canonical typed Silver source |
-| `mart_transactions_gold` | Gold | (from_id, to_id) | table | Legacy aggregation |
+| `fct_transactions_silver` | Silver | transaction | incremental (merge) | Canonical typed Silver source |
+| `mart_transactions_gold` | Gold | (customer_id, counterparty_id) | incremental (merge) | Transaction pair aggregation |
 | `mart_customer_features_gold` | Gold | (customer_id, feature_date) | incremental | Full feature computation |
 | `feature_store_customer_features` | Gold | (customer_id, feature_date) | incremental | Published feature store (rule-selected) |
 

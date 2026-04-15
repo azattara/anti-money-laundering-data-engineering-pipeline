@@ -22,7 +22,7 @@ models:
       +materialized: view
       +schema: aml_bronze
     silver:
-      +materialized: table
+      +materialized: incremental
       +schema: aml_silver
     gold:
       # Default to incremental for all Gold models; individual models can override.

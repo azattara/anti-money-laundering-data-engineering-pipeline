@@ -189,7 +189,15 @@ def clean_dataframe(df: "pyspark.sql.DataFrame") -> "pyspark.sql.DataFrame":
     # 5. Parse timestamp
     ts_col = _resolve_column(df, ["timestamp", "date_time", "transaction_date"])
     if ts_col:
-        df = df.withColumn(ts_col, F.to_timestamp(F.col(ts_col)))
+        # IBM AML Kaggle dataset uses 'yyyy/MM/dd HH:mm' format.
+        # Try explicit format first; fall back to default for other datasets.
+        df = df.withColumn(
+            ts_col,
+            F.coalesce(
+                F.to_timestamp(F.col(ts_col), "yyyy/MM/dd HH:mm"),
+                F.to_timestamp(F.col(ts_col)),
+            ),
+        )
 
     # 6. Ingestion metadata
     df = df.withColumn("_ingested_at", F.current_timestamp())
@@ -219,8 +227,12 @@ def write_silver(
     from_col = _resolve_column(df, ["from_id", "from_account", "fromid"])
     to_col = _resolve_column(df, ["to_id", "to_account", "toid"])
 
+    # Map write_mode to Spark save mode: truncate → overwrite, append → append
+    spark_mode = "overwrite" if write_mode == "truncate" else "append"
+
     writer = (
         df.write.format("bigquery")
+        .mode(spark_mode)
         .option("table", BQ_TABLE)
         .option("temporaryGcsBucket", TEMP_GCS_BUCKET)
         .option("createDisposition", "CREATE_IF_NEEDED")

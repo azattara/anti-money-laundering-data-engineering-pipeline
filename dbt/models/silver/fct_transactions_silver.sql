@@ -1,10 +1,18 @@
 -- models/silver/fct_transactions_silver.sql
 -- Silver layer: clean, typed, deduplicated transaction fact table.
 -- This model is the canonical source for all Gold/feature-store models.
--- Grain: one row per unique transaction (from_id, to_id, timestamp, amount).
+-- Grain: one row per unique transaction (customer_id, counterparty_id, amount, event_time).
+--
+-- Incremental logic:
+--   On a full-refresh run → process all history from the Silver source.
+--   On an incremental run → process only records ingested since the last run
+--   (_ingested_at > max existing). Merge on transaction_key (MD5 surrogate)
+--   so late-arriving duplicates are upserted correctly.
 
 {{ config(
-    materialized='table',
+    materialized='incremental',
+    incremental_strategy='merge',
+    unique_key='transaction_key',
     partition_by={
       "field": "feature_date",
       "data_type": "date"
@@ -12,29 +20,39 @@
     cluster_by=["customer_id", "payment_format"]
 ) }}
 
-
-
 with source as (
     select * from {{ source('aml_silver', 'transactions') }}
+    {% if is_incremental() %}
+    where _ingested_at > (select max(_ingested_at) from {{ this }})
+    {% endif %}
 ),
 
 deduplicated as (
     select
         *,
-        date(cast(timestamp as timestamp)) as feature_date, 
+        date(cast(timestamp as timestamp)) as feature_date,
         row_number() over (
-            partition by account2, account4, cast(amount_received as string), timestamp 
+            partition by account2, account4, cast(amount_received as string), timestamp
             order by _ingested_at desc
         ) as _row_num
     from source
     where
-        amount_received > 0 
+        amount_received > 0
         and account2 is not null
         and account4 is not null
         and timestamp is not null
 ),
+
 cleaned as (
     select
+        -- Surrogate key for merge (deterministic hash of natural key)
+        to_hex(md5(concat(
+            cast(account2 as string), '|',
+            cast(account4 as string), '|',
+            cast(amount_received as string), '|',
+            cast(timestamp as string)
+        ))) as transaction_key,
+
         -- Primary identifiers
         cast(account2    as string) as customer_id,
         cast(account4      as string) as counterparty_id,
