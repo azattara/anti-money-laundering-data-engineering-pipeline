@@ -171,9 +171,9 @@ def clean_dataframe(df: "pyspark.sql.DataFrame") -> "pyspark.sql.DataFrame":
     # 3. Drop rows missing critical fields
     critical_cols = [
         col for col in [
-            _resolve_column(df, ["from_id", "from_account", "fromid"]),
-            _resolve_column(df, ["to_id",   "to_account",   "toid"]),
-            _resolve_column(df, ["amount",  "amount_paid",  "usd_amount"]),
+            _resolve_column(df, ["from_id", "from_account", "fromid", "account2", "account"]),
+            _resolve_column(df, ["to_id",   "to_account",   "toid",  "account4", "account0"]),
+            _resolve_column(df, ["amount",  "amount_paid",  "usd_amount", "amount_received"]),
         ]
         if col is not None
     ]
@@ -224,8 +224,8 @@ def write_silver(
     logger.info("Writing %d rows to BigQuery table: %s (mode=%s)", row_count, BQ_TABLE, write_mode)
 
     ts_col = _resolve_column(df, ["timestamp", "date_time", "transaction_date"])
-    from_col = _resolve_column(df, ["from_id", "from_account", "fromid"])
-    to_col = _resolve_column(df, ["to_id", "to_account", "toid"])
+    from_col = _resolve_column(df, ["from_id", "from_account", "fromid", "account2", "account"])
+    to_col = _resolve_column(df, ["to_id", "to_account", "toid", "account4", "account0"])
 
     # Map write_mode to Spark save mode: truncate → overwrite, append → append
     spark_mode = "overwrite" if write_mode == "truncate" else "append"

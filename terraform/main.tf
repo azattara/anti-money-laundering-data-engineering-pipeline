@@ -225,13 +225,13 @@ resource "google_compute_firewall" "kestra" {
 
   allow {
     protocol = "tcp"
-    ports    = ["8080"]
+    ports    = ["8080", "8501"]
   }
 
   source_ranges = var.kestra_allowed_cidrs
   target_tags   = ["kestra"]
 
-  description = "Allow access to Kestra UI on port 8080"
+  description = "Allow access to Kestra UI (8080) and Streamlit dashboard (8501)"
 }
 
 resource "google_compute_address" "kestra" {

@@ -285,10 +285,10 @@ tasks:
         cd /app/dbt
         if [ "{{ inputs.run_mode }}" = "FULL_REFRESH" ]; then
           dbt run --full-refresh \
-            --select fct_transactions_silver mart_customer_features_gold feature_store_customer_features
+            --select fct_transactions_silver mart_transactions_gold mart_customer_features_gold feature_store_customer_features
         else
           dbt run \
-            --select fct_transactions_silver mart_customer_features_gold feature_store_customer_features
+            --select fct_transactions_silver mart_transactions_gold mart_customer_features_gold feature_store_customer_features
         fi
 
   # ──────────────────────────────────────────────────────────────────────────
@@ -306,7 +306,7 @@ tasks:
     commands:
       - |
         cd /app/dbt
-        dbt test --select fct_transactions_silver mart_customer_features_gold feature_store_customer_features
+        dbt test --select fct_transactions_silver mart_transactions_gold mart_customer_features_gold feature_store_customer_features
 
 errors:
   - id: notify_on_failure
