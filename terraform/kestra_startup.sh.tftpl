@@ -89,6 +89,32 @@ micronaut:
 EOF
 fi
 
+# ── dbt setup (persistent on host) ──────────────────────────────────────
+apt-get install -y python3-pip python3-venv
+if [ ! -f /opt/dbt-venv/bin/dbt ]; then
+  rm -rf /opt/dbt-venv
+  python3 -m venv /opt/dbt-venv
+  /opt/dbt-venv/bin/pip install --quiet dbt-core==1.8.2 dbt-bigquery==1.8.2
+fi
+
+mkdir -p /app/dbt
+gsutil -m rsync -r gs://${artifacts_bucket}/dbt/ /app/dbt/
+
+# Create profiles.yml for dbt
+cat >/app/dbt/profiles.yml <<DBTEOF
+anti_money_laundering:
+  target: prod
+  outputs:
+    prod:
+      type: bigquery
+      method: service-account
+      project: ${project_id}
+      dataset: aml_gold
+      threads: 4
+      keyfile: /app/secrets/key.json
+      location: US
+DBTEOF
+
 docker run -d \
   --name kestra \
   --restart unless-stopped \
@@ -100,5 +126,8 @@ docker run -d \
   -v /opt/kestra/db:/opt/kestra/db \
   -v /opt/kestra/storage:/opt/kestra/storage \
   -v /tmp/kestra-config.yml:/etc/kestra/config.yml:ro \
+  -v /etc/docker/key.json:/app/secrets/key.json:ro \
+  -v /app/dbt:/app/dbt \
+  -v /opt/dbt-venv:/opt/dbt-venv \
   kestra/kestra:latest \
   server standalone --config /etc/kestra/config.yml

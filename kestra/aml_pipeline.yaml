@@ -282,6 +282,7 @@ tasks:
       GCP_PROJECT_ID: "{{ inputs.gcp_project_id }}"
     commands:
       - |
+        export PATH="/opt/dbt-venv/bin:$PATH"
         cd /app/dbt
         if [ "{{ inputs.run_mode }}" = "FULL_REFRESH" ]; then
           dbt run --full-refresh \
@@ -305,6 +306,7 @@ tasks:
       GCP_PROJECT_ID: "{{ inputs.gcp_project_id }}"
     commands:
       - |
+        export PATH="/opt/dbt-venv/bin:$PATH"
         cd /app/dbt
         dbt test --select fct_transactions_silver mart_transactions_gold mart_customer_features_gold feature_store_customer_features
 

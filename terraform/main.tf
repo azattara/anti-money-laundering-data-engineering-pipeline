@@ -279,6 +279,7 @@ resource "google_compute_instance" "kestra" {
     kestra_basic_auth_enabled         = var.kestra_basic_auth_enabled
     kestra_basic_auth_username_secret = var.kestra_basic_auth_username_secret_name
     kestra_basic_auth_password_secret = var.kestra_basic_auth_password_secret_name
+    artifacts_bucket                  = var.gcs_artifacts_bucket
   })
 
   labels = {
