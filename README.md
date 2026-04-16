@@ -11,23 +11,26 @@ The **Gold layer is a Feature Store** with temporal feature engineering (rolling
 ## Table of Contents
 
 1. [Architecture Overview](#architecture-overview)
-2. [Project Structure](#project-structure)
-3. [Gold Layer as Feature Store](#gold-layer-as-feature-store)
-4. [Temporal Feature Engineering (Rolling Windows)](#temporal-feature-engineering-rolling-windows)
-5. [Incremental Strategy (Silver & Gold)](#incremental-strategy-silver--gold)
-6. [90-Day Lookback and Implications](#90-day-lookback-and-implications)
-7. [BigQuery Partitioning & Clustering](#bigquery-partitioning--clustering)
-8. [Feature Selection (Rule-Based)](#feature-selection-rule-based)
-9. [Dimensionality per Layer & Quality Rules](#dimensionality-per-layer--quality-rules)
-10. [Prerequisites](#prerequisites)
-11. [Kaggle Token Setup](#kaggle-token-setup)
-12. [GCP Authentication](#gcp-authentication)
-13. [Provisioning Infrastructure (Terraform)](#provisioning-infrastructure-terraform)
-14. [Starting Kestra (Docker Compose)](#starting-kestra-docker-compose)
-15. [Running the Pipeline](#running-the-pipeline)
-16. [Running dbt Incrementally](#running-dbt-incrementally)
-17. [dbt Model Reference](#dbt-model-reference)
-18. [Adding / Removing Features](#adding--removing-features)
+2. [Pipeline Topology (Kestra)](#pipeline-topology-kestra)
+3. [Pipeline Execution (Production)](#pipeline-execution-production)
+4. [Project Structure](#project-structure)
+5. [Gold Layer as Feature Store](#gold-layer-as-feature-store)
+6. [Temporal Feature Engineering (Rolling Windows)](#temporal-feature-engineering-rolling-windows)
+7. [Incremental Strategy (Silver & Gold)](#incremental-strategy-silver--gold)
+8. [90-Day Lookback and Implications](#90-day-lookback-and-implications)
+9. [BigQuery Partitioning & Clustering](#bigquery-partitioning--clustering)
+10. [Feature Selection (Rule-Based)](#feature-selection-rule-based)
+11. [Dimensionality per Layer & Quality Rules](#dimensionality-per-layer--quality-rules)
+12. [Streamlit Dashboard](#streamlit-dashboard--dimensionality-comparison)
+13. [Prerequisites](#prerequisites)
+14. [Kaggle Token Setup](#kaggle-token-setup)
+15. [GCP Authentication](#gcp-authentication)
+16. [Provisioning Infrastructure (Terraform)](#provisioning-infrastructure-terraform)
+17. [Starting Kestra (Docker Compose)](#starting-kestra-docker-compose)
+18. [Running the Pipeline](#running-the-pipeline)
+19. [Running dbt Incrementally](#running-dbt-incrementally)
+20. [dbt Model Reference](#dbt-model-reference)
+21. [Adding / Removing Features](#adding--removing-features)
 
 ---
 
@@ -66,6 +69,12 @@ Orchestration: Kestra (aml_medallion_pipeline flow)
 Infrastructure: Terraform (GCS buckets + BigQuery datasets)
 Manifest/checkpoint: aml_ops.ingestion_manifest (BigQuery)
 ```
+
+### BigQuery Datasets
+
+<p align="center">
+  <img src="images/bigquery01.PNG" alt="BigQuery datasets overview" width="800"/>
+</p>
 
 ---
 
@@ -117,9 +126,57 @@ The `aml_medallion_pipeline` flow orchestrates five sequential tasks with an err
 | `gold_dbt_test` | `scripts.shell.Commands` | Gold | Runs `dbt test` on Silver and Gold models |
 | `notify_on_failure` | `core.log.Log` | — | Error handler: logs partition and run mode on failure |
 
+### Flow Topology (Kestra UI)
+
+<p align="center">
+  <img src="images/kestra02.PNG" alt="Kestra flow topology — DAG view" width="800"/>
+</p>
+
 **Execution modes** (set via `run_mode` input):
 - **`INCREMENTAL`** — Loads only `partitions/<date>/*.csv`, PySpark processes one partition, dbt merges 90-day window
 - **`FULL_REFRESH`** — Loads all `raw/*.csv` with `WRITE_TRUNCATE`, PySpark reprocesses everything, dbt runs `--full-refresh`
+
+---
+
+## Pipeline Execution (Production)
+
+The pipeline runs on a GCE VM (`kestra-server`, `e2-standard-4`) in `us-central1-a` with Kestra orchestrating all steps inside a Docker container.
+
+### Successful End-to-End Run
+
+**Execution `627etB4VX0sEqVVaqYLlJl`** — Flow revision 16, `FULL_REFRESH` mode (April 15, 2026):
+
+<p align="center">
+  <img src="images/kestra03.PNG" alt="Successful pipeline execution — Gantt chart (34m 4.73s)" width="800"/>
+</p>
+
+| Task | Status | Details |
+|---|---|---|
+| `bronze_gcs_to_bq` | ✅ SUCCESS | Loaded 5 CSV files → `aml_bronze.transactions` (WRITE_TRUNCATE) |
+| `silver_spark_dataproc_full_refresh` | ✅ SUCCESS | PySpark on Dataproc Serverless Batches — 430.9M rows → `aml_silver.transactions` |
+| `gold_dbt_run` | ✅ SUCCESS | dbt 1.8.2 `--full-refresh` — 4 models in 70s |
+| `gold_dbt_test` | ✅ SUCCESS | 13 schema tests passed |
+
+**Gold layer output (dbt run):**
+
+| Model | Rows | Data Processed | Time |
+|---|---|---|---|
+| `fct_transactions_silver` | 430.9M | 33.0 GiB | 25s |
+| `mart_transactions_gold` | 20.6M | 15.2 GiB | 10s |
+| `mart_customer_features_gold` | 107.9M | 26.6 GiB | 32s |
+| `feature_store_customer_features` | 107.9M | 24.6 GiB | 12s |
+
+### Infrastructure
+
+| Component | Details |
+|---|---|
+| **Kestra** | Docker container (`kestra-with-dbt:latest`) at `http://<VM_IP>:8080` |
+| **dbt** | Installed inside Kestra container (v1.8.2 + dbt-bigquery 1.8.2) |
+| **dbt project** | Mounted from host `/app/dbt` via Docker volume |
+| **SA credentials** | Mounted from `/etc/docker/key.json` → `/app/secrets/key.json` (read-only) |
+| **Streamlit Dashboard** | Docker container (`aml-dashboard`) at `http://<VM_IP>:8501` |
+| **Silver processing** | Dataproc Serverless Batches (12 vCPUs, auto-scaling) |
+| **BigQuery datasets** | `aml_bronze`, `aml_silver`, `aml_gold`, `aml_ops` |
 
 ---
 
@@ -320,6 +377,10 @@ This section documents the schema (columns) of each layer, the grain, and the qu
 
 ### Bronze — Raw Source
 
+<p align="center">
+  <img src="images/bigquery02.PNG" alt="BigQuery — aml_bronze dataset" width="800"/>
+</p>
+
 | Property | Value |
 |---|---|
 | **Table** | `aml_bronze.transactions` |
@@ -329,6 +390,14 @@ This section documents the schema (columns) of each layer, the grain, and the qu
 | **Quality rules** | None — this layer is an immutable landing zone |
 
 ### Silver — Cleaned & Typed
+
+<p align="center">
+  <img src="images/bigquery03.PNG" alt="BigQuery — aml_silver dataset" width="800"/>
+</p>
+
+<p align="center">
+  <img src="images/bigquery04.PNG" alt="fct_transactions_silver — partitioned table schema" width="800"/>
+</p>
 
 | Property | Value |
 |---|---|
@@ -351,6 +420,10 @@ This section documents the schema (columns) of each layer, the grain, and the qu
 > **PySpark upstream** (`spark/clean_aml_data.py`) also applies column normalisation, `dropDuplicates()`, null drops on critical fields, positive-amount filter, type casting, and `_ingested_at` metadata — providing defence-in-depth before data reaches dbt.
 
 ### Gold — Feature Store (Compute Layer)
+
+<p align="center">
+  <img src="images/bigquery05.PNG" alt="BigQuery — aml_gold tables" width="800"/>
+</p>
 
 | Property | Value |
 |---|---|
@@ -410,6 +483,22 @@ Bronze (raw)  ──▶  Silver (11 cols)  ──▶  Gold compute (~40 cols)  �
    no rules         6 quality rules        rolling-window expansion      4 selection rules
    all records      deduplicated           (customer_id, date) grain     curated for ML
 ```
+
+### Streamlit Dashboard — Dimensionality Comparison
+
+A Streamlit dashboard is deployed alongside Kestra on the same VM (port 8501) to visualize the dimensionality progression across layers.
+
+<p align="center">
+  <img src="images/dash01.jpg" alt="Dashboard — Schema comparison & Dimensionality Funnel" width="700"/>
+</p>
+
+<p align="center">
+  <img src="images/dash02.jpg" alt="Dashboard — Row Count by Layer & Data Quality Null Rates" width="700"/>
+</p>
+
+<p align="center">
+  <img src="images/dash03.jpg" alt="Dashboard — Feature Correlation & Sample Data Preview" width="700"/>
+</p>
 
 ---
 
