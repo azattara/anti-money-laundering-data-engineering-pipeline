@@ -174,7 +174,7 @@ The pipeline runs on a GCE VM (`kestra-server`, `e2-standard-4`) in `us-central1
 | **dbt** | Installed inside Kestra container (v1.8.2 + dbt-bigquery 1.8.2) |
 | **dbt project** | Mounted from host `/app/dbt` via Docker volume |
 | **SA credentials** | Mounted from `/etc/docker/key.json` → `/app/secrets/key.json` (read-only) |
-| **Streamlit Dashboard** | Docker container (`aml-dashboard`) at `http://<VM_IP>:8501` |
+| **Streamlit Dashboard** | Docker container (`aml-dashboard`) at [`http://34.69.8.242:8501`](http://34.69.8.242:8501) |
 | **Silver processing** | Dataproc Serverless Batches (12 vCPUs, auto-scaling) |
 | **BigQuery datasets** | `aml_bronze`, `aml_silver`, `aml_gold`, `aml_ops` |
 
@@ -486,7 +486,9 @@ Bronze (raw)  ──▶  Silver (11 cols)  ──▶  Gold compute (~40 cols)  �
 
 ### Streamlit Dashboard — Dimensionality Comparison
 
-A Streamlit dashboard is deployed alongside Kestra on the same VM (port 8501) to visualize the dimensionality progression across layers.
+A Streamlit dashboard is deployed alongside Kestra on the same VM to visualize the dimensionality progression across layers.
+
+> **Live:** [http://34.69.8.242:8501](http://34.69.8.242:8501)
 
 <p align="center">
   <img src="images/dash01.jpg" alt="Dashboard — Schema comparison & Dimensionality Funnel" width="700"/>
