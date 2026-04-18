@@ -30,7 +30,7 @@ The **Gold layer is a Feature Store** with temporal feature engineering (rolling
 9. [BigQuery Partitioning & Clustering](#bigquery-partitioning--clustering)
 10. [Feature Selection (Rule-Based)](#feature-selection-rule-based)
 11. [Dimensionality per Layer & Quality Rules](#dimensionality-per-layer--quality-rules)
-12. [Streamlit Dashboard](#streamlit-dashboard--dimensionality-comparison)
+12. [Streamlit Dashboard](#streamlit-dashboard--feature-engineering--risk-scoring-analysis)
 13. [Prerequisites](#prerequisites)
 14. [Kaggle Token Setup](#kaggle-token-setup)
 15. [GCP Authentication](#gcp-authentication)
@@ -493,11 +493,17 @@ Bronze (raw)  ──▶  Silver (11 cols)  ──▶  Gold compute (~40 cols)  �
    all records      deduplicated           (customer_id, date) grain     curated for ML
 ```
 
-### Streamlit Dashboard — Dimensionality Comparison
+### Streamlit Dashboard — Feature Engineering & Risk Scoring Analysis
 
-A Streamlit dashboard is deployed alongside Kestra on the same VM to visualize the dimensionality progression across layers.
+A Streamlit dashboard is deployed alongside Kestra on the same VM to visualize the dimensionality progression across layers and expose an AML-oriented risk monitoring view built on top of the Gold feature store.
 
 > **Live:** [http://34.69.8.242:8501](http://34.69.8.242:8501)
+
+The current dashboard combines three perspectives in a single interface:
+
+- **Dimensionality analysis** across Bronze, Silver, and Gold to show how the medallion pipeline reduces grain and curates features.
+- **AML business monitoring** with top suspicious accounts, risk score, primary signal explanation, behavior evolution, and real-time alerts.
+- **Incremental execution analysis** to show exactly what changed in Gold between the last two incremental runs.
 
 <p align="center">
   <img src="images/dash01.jpg" alt="Dashboard — Schema comparison & Dimensionality Funnel" width="700"/>
@@ -510,6 +516,21 @@ A Streamlit dashboard is deployed alongside Kestra on the same VM to visualize t
 <p align="center">
   <img src="images/dash03.jpg" alt="Dashboard — Feature Correlation & Sample Data Preview" width="700"/>
 </p>
+
+<p align="center">
+  <img src="images/dash04.jpg" alt="Dashboard — AML business monitoring with risk score, suspicious accounts, and real-time alerts" width="700"/>
+</p>
+
+<p align="center">
+  <img src="images/dash05.jpg" alt="Dashboard — Incremental change footprint comparing recent Gold refreshes" width="700"/>
+</p>
+
+**What was added in the latest dashboard update:**
+
+- A renamed landing section: **AML Pipeline — Feature Engineering & Risk Scoring Analysis**.
+- A business-facing AML panel with suspicious-account ranking, 7d vs 90d behavior evolution, risk score, and alert summaries.
+- An incremental footprint section showing refreshed Gold rows, affected customers, recomputed days, and day-level deltas between recent runs.
+- Production styling support for gradient-highlighted tables via the dashboard image dependency set.
 
 ---
 
