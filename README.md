@@ -525,12 +525,15 @@ The current dashboard combines three perspectives in a single interface:
   <img src="images/dash05.jpg" alt="Dashboard — Incremental change footprint comparing recent Gold refreshes" width="700"/>
 </p>
 
-**What was added in the latest dashboard update:**
+The views below are part of the full dashboard available at [http://34.69.8.242:8501](http://34.69.8.242:8501).
 
-- A renamed landing section: **AML Pipeline — Feature Engineering & Risk Scoring Analysis**.
-- A business-facing AML panel with suspicious-account ranking, 7d vs 90d behavior evolution, risk score, and alert summaries.
-- An incremental footprint section showing refreshed Gold rows, affected customers, recomputed days, and day-level deltas between recent runs.
-- Production styling support for gradient-highlighted tables via the dashboard image dependency set.
+#### 4 — 📊 Dashboard AML (Business)
+
+This section presents the business-facing AML monitoring layer of the dashboard. It highlights the top suspicious accounts from the latest Gold snapshot, explains the primary risk signal for a selected customer, compares short-term behavior against the 90-day baseline, and surfaces real-time alerts for accounts above the configured risk thresholds.
+
+#### 5 — Incremental Change Footprint
+
+This section explains what changed between the last two incremental Gold refreshes. It summarizes refreshed rows, affected customers, recomputed dates, and daily deltas, making it easier to understand the operational impact of each incremental execution without scanning orchestration or dbt logs.
 
 ---
 
