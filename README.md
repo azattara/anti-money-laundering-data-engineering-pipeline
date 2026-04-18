@@ -513,18 +513,6 @@ The current dashboard combines three perspectives in a single interface:
   <img src="images/dash02.jpg" alt="Dashboard — Row Count by Layer & Data Quality Null Rates" width="700"/>
 </p>
 
-<p align="center">
-  <img src="images/dash03.jpg" alt="Dashboard — Feature Correlation & Sample Data Preview" width="700"/>
-</p>
-
-<p align="center">
-  <img src="images/dash04.jpg" alt="Dashboard — AML business monitoring with risk score, suspicious accounts, and real-time alerts" width="700"/>
-</p>
-
-<p align="center">
-  <img src="images/dash05.jpg" alt="Dashboard — Incremental change footprint comparing recent Gold refreshes" width="700"/>
-</p>
-
 The views below are part of the full dashboard available at [http://34.69.8.242:8501](http://34.69.8.242:8501).
 
 #### 4 — 📊 Dashboard AML (Business)
