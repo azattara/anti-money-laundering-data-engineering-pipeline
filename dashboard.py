@@ -1,5 +1,5 @@
 """
-AML Pipeline — Dimensionality Comparison Dashboard
+AML Pipeline — Feature Engineering & Risk Scoring Analysis Dashboard
 Compares raw Silver data vs curated Gold Feature Store data.
 """
 
@@ -28,6 +28,30 @@ def get_bq_client():
 @st.cache_data(ttl=600)
 def run_query(sql: str) -> pd.DataFrame:
     return get_bq_client().query(sql).to_dataframe()
+
+
+def quote_sql_string(value: str) -> str:
+        return value.replace("'", "''")
+
+
+RISK_SCORE_SQL = """
+least(
+    100.0,
+    round(
+        100 * (
+            0.30 * least(coalesce(velocity_spike_ratio_7d, 0.0) / 10.0, 1.0) +
+            0.25 * least(coalesce(cross_currency_ratio_30d, 0.0), 1.0) +
+            0.20 * least(coalesce(amount_max_to_avg_ratio_7d, 0.0) / 8.0, 1.0) +
+            0.15 * greatest(1.0 - least(coalesce(counterparty_concentration_30d, 1.0), 1.0), 0.0) +
+            0.10 * least(
+                safe_divide(coalesce(tx_count_7d, 0.0) * 90.0, nullif(coalesce(tx_count_90d, 0.0), 0.0)),
+                1.0
+            )
+        ),
+        1
+    )
+)
+"""
 
 
 # ── Queries ──────────────────────────────────────────────────────────────────
@@ -126,6 +150,153 @@ SELECT 'Gold Serving (~25 cols)', COUNT(*)
 FROM `anti-ml-data-engineering.aml_gold_aml_gold.feature_store_customer_features`
 """
 
+Q_TOP_SUSPICIOUS_ACCOUNTS = f"""
+with latest_snapshot as (
+    select *
+    from `anti-ml-data-engineering.aml_gold_aml_gold.feature_store_customer_features`
+    where feature_date = (
+        select max(feature_date)
+        from `anti-ml-data-engineering.aml_gold_aml_gold.feature_store_customer_features`
+    )
+),
+scored as (
+    select
+        customer_id,
+        feature_date,
+        tx_count_7d,
+        tx_count_90d,
+        tx_amount_sum_7d,
+        tx_amount_sum_90d,
+        cross_currency_ratio_30d,
+        counterparty_concentration_30d,
+        amount_max_to_avg_ratio_7d,
+        velocity_spike_ratio_7d,
+        days_since_last_tx,
+        {RISK_SCORE_SQL} as risk_score
+    from latest_snapshot
+)
+select
+    customer_id,
+    feature_date,
+    risk_score,
+    case
+        when risk_score >= 85 then 'Critical'
+        when risk_score >= 70 then 'High'
+        when risk_score >= 55 then 'Elevated'
+        else 'Monitor'
+    end as alert_level,
+    round(velocity_spike_ratio_7d, 2) as velocity_spike_ratio_7d,
+    round(cross_currency_ratio_30d, 2) as cross_currency_ratio_30d,
+    round(amount_max_to_avg_ratio_7d, 2) as amount_max_to_avg_ratio_7d,
+    round(counterparty_concentration_30d, 2) as counterparty_concentration_30d,
+    tx_count_7d,
+    tx_count_90d,
+    days_since_last_tx,
+    case
+        when velocity_spike_ratio_7d >= 5 and cross_currency_ratio_30d >= 0.25 then 'Velocity spike and cross-currency activity'
+        when amount_max_to_avg_ratio_7d >= 4 then 'Large transaction versus baseline'
+        when counterparty_concentration_30d <= 0.15 then 'Concentrated counterparty behaviour'
+        else 'Monitoring threshold exceeded'
+    end as primary_signal
+from scored
+order by risk_score desc, velocity_spike_ratio_7d desc, tx_count_7d desc
+limit 20
+"""
+
+Q_ALERT_SUMMARY = f"""
+with latest_snapshot as (
+    select *
+    from `anti-ml-data-engineering.aml_gold_aml_gold.feature_store_customer_features`
+    where feature_date = (
+        select max(feature_date)
+        from `anti-ml-data-engineering.aml_gold_aml_gold.feature_store_customer_features`
+    )
+),
+scored as (
+    select
+        feature_date,
+        {RISK_SCORE_SQL} as risk_score
+    from latest_snapshot
+)
+select
+    max(feature_date) as latest_feature_date,
+    countif(risk_score >= 85) as critical_alerts,
+    countif(risk_score >= 70) as active_alerts,
+    countif(risk_score >= 55) as monitored_accounts,
+    max(risk_score) as max_risk_score,
+    round(avg(risk_score), 1) as avg_risk_score
+from scored
+"""
+
+Q_BEHAVIOR_EVOLUTION_TEMPLATE = f"""
+with scored as (
+    select
+        feature_date,
+        tx_count_7d,
+        round(safe_divide(tx_count_90d, 90.0) * 7.0, 2) as tx_count_90d_baseline_7d,
+        tx_amount_sum_7d,
+        round(safe_divide(tx_amount_sum_90d, 90.0) * 7.0, 2) as tx_amount_90d_baseline_7d,
+        cross_currency_ratio_30d,
+        velocity_spike_ratio_7d,
+        {RISK_SCORE_SQL} as risk_score
+    from `anti-ml-data-engineering.aml_gold_aml_gold.feature_store_customer_features`
+    where customer_id = '{{customer_id}}'
+)
+select *
+from scored
+order by feature_date
+"""
+
+Q_INCREMENTAL_RUNS = """
+with recent_runs as (
+    select
+        feature_created_at as run_ts,
+        count(*) as rows_touched,
+        count(distinct customer_id) as customers_touched,
+        min(feature_date) as min_feature_date,
+        max(feature_date) as max_feature_date,
+        count(distinct feature_date) as affected_days,
+        dense_rank() over (order by feature_created_at desc) as run_rank
+    from `anti-ml-data-engineering.aml_gold_aml_gold.feature_store_customer_features`
+    group by feature_created_at
+)
+select
+    run_rank,
+    run_ts,
+    rows_touched,
+    customers_touched,
+    min_feature_date,
+    max_feature_date,
+    affected_days
+from recent_runs
+where run_rank <= 2
+order by run_rank
+"""
+
+Q_INCREMENTAL_FOOTPRINT = """
+with recent_runs as (
+    select
+        feature_created_at as run_ts,
+        dense_rank() over (order by feature_created_at desc) as run_rank
+    from `anti-ml-data-engineering.aml_gold_aml_gold.feature_store_customer_features`
+    group by feature_created_at
+    qualify run_rank <= 2
+)
+select
+    case
+        when run_rank = 1 then 'Latest incremental run'
+        when run_rank = 2 then 'Previous incremental run'
+    end as run_label,
+    feature_date,
+    count(*) as rows_touched,
+    count(distinct customer_id) as customers_touched
+from `anti-ml-data-engineering.aml_gold_aml_gold.feature_store_customer_features` fs
+join recent_runs rr
+    on fs.feature_created_at = rr.run_ts
+group by run_label, feature_date
+order by feature_date desc, run_label
+"""
+
 
 # ── Page config ──────────────────────────────────────────────────────────────
 
@@ -135,7 +306,7 @@ st.set_page_config(
     layout="wide",
 )
 
-st.title("AML Pipeline — Dimensionality Comparison")
+st.title("AML Pipeline — Feature Engineering & Risk Scoring Analysis")
 st.caption("Silver (raw transactions) vs Gold Feature Store (curated features)")
 
 # ── Load data ────────────────────────────────────────────────────────────────
@@ -147,6 +318,10 @@ with st.spinner("Loading metadata from BigQuery..."):
     silver_stats = run_query(Q_SILVER_STATS).iloc[0]
     gold_stats = run_query(Q_GOLD_STATS).iloc[0]
     grain_df = run_query(Q_GRAIN_COMPARISON)
+    suspicious_accounts = run_query(Q_TOP_SUSPICIOUS_ACCOUNTS)
+    alert_summary = run_query(Q_ALERT_SUMMARY).iloc[0]
+    incremental_runs = run_query(Q_INCREMENTAL_RUNS)
+    incremental_footprint = run_query(Q_INCREMENTAL_FOOTPRINT)
 
 # ═════════════════════════════════════════════════════════════════════════════
 # TILE 1: Silver (Raw)                 │ TILE 2: Gold Feature Store (Curated)
@@ -242,10 +417,304 @@ st.info(
     f"(1 per customer × day), a **{silver_stats['row_count'] / gold_stats['row_count']:.1f}x** reduction in granularity."
 )
 
+# ── AML business dashboard ───────────────────────────────────────────────────
+
+st.markdown("---")
+st.header("4 — 📊 Dashboard AML (Business)")
+st.caption("Risk-oriented monitoring built from the latest Gold feature snapshot.")
+
+refresh_col, summary_col = st.columns([1, 4])
+with refresh_col:
+    if st.button("Refresh alerts", use_container_width=True):
+        st.cache_data.clear()
+        st.rerun()
+
+with summary_col:
+    st.markdown(
+        f"**Latest snapshot:** {alert_summary['latest_feature_date']} | "
+        f"**Critical alerts:** {alert_summary['critical_alerts']:,.0f} | "
+        f"**Active alerts:** {alert_summary['active_alerts']:,.0f}"
+    )
+
+summary_metrics = st.columns(4)
+summary_metrics[0].metric("Critical Alerts", f"{alert_summary['critical_alerts']:,.0f}")
+summary_metrics[1].metric("Active Alerts", f"{alert_summary['active_alerts']:,.0f}")
+summary_metrics[2].metric("Average Risk Score", f"{alert_summary['avg_risk_score']:.1f}")
+summary_metrics[3].metric("Max Risk Score", f"{alert_summary['max_risk_score']:.1f}")
+
+if suspicious_accounts.empty:
+    st.warning("No suspicious accounts were found in the latest Gold snapshot.")
+else:
+    display_accounts = suspicious_accounts.rename(
+        columns={
+            "customer_id": "Customer ID",
+            "feature_date": "Feature Date",
+            "risk_score": "Risk Score",
+            "alert_level": "Alert Level",
+            "velocity_spike_ratio_7d": "Velocity Spike 7d",
+            "cross_currency_ratio_30d": "Cross-Currency Ratio 30d",
+            "amount_max_to_avg_ratio_7d": "Amount Max/Avg Ratio 7d",
+            "counterparty_concentration_30d": "Counterparty Concentration 30d",
+            "tx_count_7d": "Tx Count 7d",
+            "tx_count_90d": "Tx Count 90d",
+            "days_since_last_tx": "Days Since Last Tx",
+            "primary_signal": "Primary Signal",
+        }
+    )
+
+    st.subheader("Top suspicious accounts")
+    st.dataframe(
+        display_accounts.style.format(
+            {
+                "Risk Score": "{:.1f}",
+                "Velocity Spike 7d": "{:.2f}",
+                "Cross-Currency Ratio 30d": "{:.2f}",
+                "Amount Max/Avg Ratio 7d": "{:.2f}",
+                "Counterparty Concentration 30d": "{:.2f}",
+                "Tx Count 7d": "{:,.0f}",
+                "Tx Count 90d": "{:,.0f}",
+                "Days Since Last Tx": "{:.0f}",
+            }
+        ).background_gradient(subset=["Risk Score"], cmap="YlOrRd"),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    account_labels = [
+        f"{row['customer_id']} | score {row['risk_score']:.1f} | {row['primary_signal']}"
+        for _, row in suspicious_accounts.iterrows()
+    ]
+    selected_label = st.selectbox("Inspect suspicious account", account_labels)
+    selected_customer = selected_label.split(" | ", 1)[0]
+    behavior_query = Q_BEHAVIOR_EVOLUTION_TEMPLATE.format(
+        customer_id=quote_sql_string(selected_customer)
+    )
+    behavior_df = run_query(behavior_query)
+    latest_customer = suspicious_accounts.loc[
+        suspicious_accounts["customer_id"] == selected_customer
+    ].iloc[0]
+
+    gauge_col, chart_col = st.columns([1, 2])
+
+    with gauge_col:
+        st.subheader("Risk score")
+        gauge = go.Figure(
+            go.Indicator(
+                mode="gauge+number",
+                value=float(latest_customer["risk_score"]),
+                number={"suffix": "/100"},
+                gauge={
+                    "axis": {"range": [0, 100]},
+                    "bar": {"color": "#C44536"},
+                    "steps": [
+                        {"range": [0, 55], "color": "#D8F3DC"},
+                        {"range": [55, 70], "color": "#FFE8A3"},
+                        {"range": [70, 85], "color": "#F9C74F"},
+                        {"range": [85, 100], "color": "#F94144"},
+                    ],
+                },
+                title={"text": latest_customer["alert_level"]},
+            )
+        )
+        gauge.update_layout(height=280, margin=dict(l=20, r=20, t=60, b=20))
+        st.plotly_chart(gauge, use_container_width=True)
+        st.caption("Primary signal")
+        st.markdown(f"**{latest_customer['primary_signal']}**")
+        st.metric("Days since last tx", f"{latest_customer['days_since_last_tx']:.0f}")
+
+    with chart_col:
+        st.subheader("Behaviour evolution (7d vs 90d baseline)")
+        behavior_chart = make_subplots(specs=[[{"secondary_y": True}]])
+        behavior_chart.add_trace(
+            go.Scatter(
+                x=behavior_df["feature_date"],
+                y=behavior_df["tx_count_7d"],
+                name="7d activity",
+                mode="lines",
+                line=dict(color="#D96C4A", width=3),
+            ),
+            secondary_y=False,
+        )
+        behavior_chart.add_trace(
+            go.Scatter(
+                x=behavior_df["feature_date"],
+                y=behavior_df["tx_count_90d_baseline_7d"],
+                name="90d baseline (7d-equivalent)",
+                mode="lines",
+                line=dict(color="#4A90D9", width=2, dash="dash"),
+            ),
+            secondary_y=False,
+        )
+        behavior_chart.add_trace(
+            go.Scatter(
+                x=behavior_df["feature_date"],
+                y=behavior_df["risk_score"],
+                name="Risk score",
+                mode="lines",
+                line=dict(color="#222222", width=2),
+            ),
+            secondary_y=True,
+        )
+        behavior_chart.update_layout(height=340, legend_orientation="h")
+        behavior_chart.update_yaxes(title_text="Transactions", secondary_y=False)
+        behavior_chart.update_yaxes(title_text="Risk score", range=[0, 100], secondary_y=True)
+        st.plotly_chart(behavior_chart, use_container_width=True)
+
+    st.subheader("Real-time alerts")
+    alert_rows = suspicious_accounts[suspicious_accounts["risk_score"] >= 70].head(5)
+    if alert_rows.empty:
+        st.success("No high-risk alerts in the latest snapshot.")
+    else:
+        for _, alert in alert_rows.iterrows():
+            severity_label = f"{alert['alert_level']} | score {alert['risk_score']:.1f}"
+            message = (
+                f"Customer {alert['customer_id']} on {alert['feature_date']}: "
+                f"{alert['primary_signal']}. 7d activity={alert['tx_count_7d']:,.0f}, "
+                f"cross-currency ratio 30d={alert['cross_currency_ratio_30d']:.2f}."
+            )
+            if alert["risk_score"] >= 85:
+                st.error(f"{severity_label} — {message}")
+            else:
+                st.warning(f"{severity_label} — {message}")
+
+# ── Incremental execution footprint ──────────────────────────────────────────
+
+st.markdown("---")
+st.header("5 — Incremental Change Footprint")
+st.caption(
+    "This view shows exactly what the last incremental batch refreshed in Gold, "
+    "compared with the previous one."
+)
+
+if len(incremental_runs) >= 2:
+    latest_run = incremental_runs.iloc[0]
+    previous_run = incremental_runs.iloc[1]
+
+    latest_ts = pd.to_datetime(latest_run["run_ts"])
+    previous_ts = pd.to_datetime(previous_run["run_ts"])
+    rows_delta = latest_run["rows_touched"] - previous_run["rows_touched"]
+    customers_delta = latest_run["customers_touched"] - previous_run["customers_touched"]
+
+    st.markdown(
+        f"**Executive summary:** the latest incremental run refreshed **{latest_run['rows_touched']:,.0f}** Gold rows "
+        f"for **{latest_run['customers_touched']:,.0f}** customers across **{latest_run['affected_days']:,.0f}** days. "
+        f"Compared with the previous run, that is a change of **{rows_delta:,.0f}** rows and "
+        f"**{customers_delta:,.0f}** customers."
+    )
+
+    col_latest, col_previous, col_delta, col_window = st.columns(4)
+
+    with col_latest:
+        st.metric("Latest Batch", latest_ts.strftime("%Y-%m-%d %H:%M:%S UTC"))
+        st.metric("Gold Rows Refreshed", f"{latest_run['rows_touched']:,.0f}")
+
+    with col_previous:
+        st.metric("Previous Batch", previous_ts.strftime("%Y-%m-%d %H:%M:%S UTC"))
+        st.metric("Gold Rows Refreshed", f"{previous_run['rows_touched']:,.0f}")
+
+    with col_delta:
+        st.metric(
+            "Change in Refreshed Rows",
+            f"{rows_delta:,.0f}",
+            delta=f"{(rows_delta / previous_run['rows_touched'] * 100):.1f}%" if previous_run['rows_touched'] else None,
+        )
+        st.metric(
+            "Change in Customers",
+            f"{customers_delta:,.0f}",
+            delta=f"{(customers_delta / previous_run['customers_touched'] * 100):.1f}%" if previous_run['customers_touched'] else None,
+        )
+
+    with col_window:
+        st.metric("Days Recomputed", f"{latest_run['affected_days']:,.0f}")
+        st.metric(
+            "Date Window",
+            f"{latest_run['min_feature_date']} to {latest_run['max_feature_date']}",
+        )
+
+    footprint_chart = px.bar(
+        incremental_footprint,
+        x="feature_date",
+        y="rows_touched",
+        color="run_label",
+        barmode="group",
+        labels={
+            "feature_date": "Feature Date",
+            "rows_touched": "Gold Rows Refreshed",
+            "run_label": "Incremental Batch",
+        },
+        color_discrete_sequence=["#D96C4A", "#4A90D9"],
+    )
+    footprint_chart.update_layout(height=420, legend_title_text="Compared Batches")
+    st.plotly_chart(footprint_chart, use_container_width=True)
+
+    footprint_table = incremental_footprint.pivot(
+        index="feature_date",
+        columns="run_label",
+        values="rows_touched",
+    ).fillna(0)
+    footprint_table["delta_rows"] = (
+        footprint_table.get("Latest incremental run", 0)
+        - footprint_table.get("Previous incremental run", 0)
+    )
+    footprint_table = footprint_table.sort_index(ascending=False).reset_index()
+    footprint_table = footprint_table.rename(
+        columns={
+            "feature_date": "Feature Date",
+            "Latest incremental run": "Latest Batch",
+            "Previous incremental run": "Previous Batch",
+            "delta_rows": "Net Change",
+        }
+    )
+
+    top_changes = footprint_table.reindex(
+        footprint_table["Net Change"].abs().sort_values(ascending=False).index
+    ).head(10)
+
+    highlight_chart = px.bar(
+        top_changes.sort_values("Net Change", ascending=True),
+        x="Net Change",
+        y="Feature Date",
+        orientation="h",
+        color="Net Change",
+        color_continuous_scale=["#D96C4A", "#F4D35E", "#4A90D9"],
+        labels={
+            "Net Change": "Net Change in Gold Rows",
+            "Feature Date": "Feature Date",
+        },
+    )
+    highlight_chart.update_layout(height=360, coloraxis_showscale=False)
+
+    col_chart, col_table = st.columns([3, 2])
+    with col_chart:
+        st.markdown("**Largest day-level changes**")
+        st.plotly_chart(highlight_chart, use_container_width=True)
+
+    with col_table:
+        st.markdown("**Detailed daily comparison**")
+        st.dataframe(
+            footprint_table.style.format(
+                {
+                    "Latest Batch": "{:,.0f}",
+                    "Previous Batch": "{:,.0f}",
+                    "Net Change": "{:+,.0f}",
+                }
+            ).background_gradient(subset=["Net Change"], cmap="RdYlBu"),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    st.info(
+        "Incremental execution does not rebuild the full Gold layer. It refreshes only the recent "
+        "feature window, and the chart above shows exactly which feature_date partitions changed "
+        "between the last two runs."
+    )
+else:
+    st.warning("Not enough incremental history yet to compare the latest Gold batch with a previous one.")
+
 # ── Null rate comparison ─────────────────────────────────────────────────────
 
 st.markdown("---")
-st.header("4 — Data Quality: Null Rates (Silver)")
+st.header("6 — Data Quality: Null Rates (Silver)")
 
 with st.spinner("Checking null rates..."):
     null_df = run_query(Q_NULL_RATES_SILVER)
@@ -267,7 +736,7 @@ st.success("All critical columns (customer_id, counterparty_id, amount, event_ti
 # ── Correlation heatmap ──────────────────────────────────────────────────────
 
 st.markdown("---")
-st.header("5 — Feature Correlation (Gold Serving)")
+st.header("7 — Feature Correlation (Gold Serving)")
 st.caption("Sampled ~0.1% of rows for visualization. Low inter-feature correlation confirms RULE-3 (redundancy removal) is effective.")
 
 with st.spinner("Computing correlation matrix..."):
@@ -291,7 +760,7 @@ else:
 # ── Sample data preview ──────────────────────────────────────────────────────
 
 st.markdown("---")
-st.header("6 — Sample Data Preview")
+st.header("8 — Sample Data Preview")
 
 tab_silver, tab_gold = st.tabs(["🟦 Silver (Raw)", "🟨 Gold (Feature Store)"])
 

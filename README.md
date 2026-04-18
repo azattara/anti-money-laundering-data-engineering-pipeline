@@ -1,5 +1,14 @@
 # Anti Money Laundering — Data Engineering Pipeline
 
+
+
+
+Money laundering remains one of the most persistent threats to the stability of the global financial ecosystem. The complexity and volume of transactions, combined with the growing adoption of digital banks and fintech platforms, have increased the urgency for more intelligent and scalable Anti-Money Laundering (AML) systems.
+
+In this context, solutions such as IBM Transactions for Anti-Money Laundering (AML) play a fundamental role by providing realistic synthetic datasets for training machine learning models, allowing institutions to test and improve the detection of suspicious patterns without compromising the privacy of real data.
+
+The project aims to create a data foundation for a money laundering detection system capable of analyzing financial behavior over time and generating risk indicators per entity. This foundation is built by transforming raw transaction data into a behavioral dataset per account, considering its temporal evolution. Initially, the data is ingested (Bronze) and undergoes cleaning processes (Silver). Next, temporal aggregations with rolling windows—such as 7, 30, and 90 days—are applied to generate metrics such as volume, frequency, and average transaction value. These metrics are then compared across short- and long-term horizons (for example, the last 7 days versus the 90-day average), enabling the identification of behavioral deviations. As a result, a final (Gold) table is produced, partitioned and optimized, representing the financial behavior of each entity and serving as the basis for risk scoring, anomaly detection, and the application of machine learning models in anti-money laundering systems.
+
 A production-ready **Medallion Architecture** (Bronze / Silver / Gold) data pipeline for the [IBM Transactions for Anti Money Laundering (AML)](https://www.kaggle.com/datasets/ealtman2019/ibm-transactions-for-anti-money-laundering-aml) Kaggle dataset, orchestrated with **Kestra**, processed with **PySpark**, stored on **Google Cloud Storage** and **BigQuery**, and modelled with **dbt**.
 
 The ingestion layer downloads the dataset from Kaggle to a temporary file on disk and **streams each CSV directly to GCS** via the Google Cloud Storage Python client — no persistent local files are kept. The Kestra pipeline then loads the CSVs from GCS into BigQuery (Bronze), runs PySpark for cleaning (Silver), and dbt for feature engineering (Gold).

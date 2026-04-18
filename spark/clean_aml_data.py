@@ -149,6 +149,14 @@ def _resolve_column(df: "pyspark.sql.DataFrame", candidates: List[str]) -> Optio
     return None
 
 
+def _cast_columns(df: "pyspark.sql.DataFrame", columns: List[str], spark_type) -> "pyspark.sql.DataFrame":
+    """Cast existing columns to a target Spark type."""
+    for column in columns:
+        if column in df.columns:
+            df = df.withColumn(column, F.col(column).cast(spark_type))
+    return df
+
+
 def clean_dataframe(df: "pyspark.sql.DataFrame") -> "pyspark.sql.DataFrame":
     """
     Apply Silver-layer cleaning transformations:
@@ -162,6 +170,31 @@ def clean_dataframe(df: "pyspark.sql.DataFrame") -> "pyspark.sql.DataFrame":
     """
     # 1. Standardise column names
     df = df.toDF(*[c.lower().replace(" ", "_") for c in df.columns])
+
+    # Stabilise inferred CSV types so incremental partitions match the target schema.
+    df = _cast_columns(
+        df,
+        [
+            "from_bank",
+            "to_bank",
+            "from_id",
+            "to_id",
+            "from_account",
+            "to_account",
+            "fromid",
+            "toid",
+            "account",
+            "account0",
+            "account2",
+            "account4",
+            "receiving_currency",
+            "payment_currency",
+            "payment_format",
+        ],
+        StringType(),
+    )
+    df = _cast_columns(df, ["amount", "amount_paid", "amount_received", "usd_amount"], DoubleType())
+    df = _cast_columns(df, ["is_laundering"], "int")
 
     # 2. Deduplication
     before = df.count()
