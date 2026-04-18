@@ -509,20 +509,15 @@ The current dashboard combines three perspectives in a single interface:
   <img src="images/dash01.jpg" alt="Dashboard — Schema comparison & Dimensionality Funnel" width="700"/>
 </p>
 
+This section presents the business-facing AML monitoring layer of the dashboard. It highlights the top suspicious accounts from the latest Gold snapshot, explains the primary risk signal for a selected customer, compares short-term behavior against the 90-day baseline, and surfaces real-time alerts for accounts above the configured risk thresholds.
+
 <p align="center">
   <img src="images/dash02.jpg" alt="Dashboard — Row Count by Layer & Data Quality Null Rates" width="700"/>
 </p>
 
-The views below are part of the full dashboard available at [http://34.69.8.242:8501](http://34.69.8.242:8501).
-
-#### 4 — 📊 Dashboard AML (Business)
-
-This section presents the business-facing AML monitoring layer of the dashboard. It highlights the top suspicious accounts from the latest Gold snapshot, explains the primary risk signal for a selected customer, compares short-term behavior against the 90-day baseline, and surfaces real-time alerts for accounts above the configured risk thresholds.
-
-#### 5 — Incremental Change Footprint
-
 This section explains what changed between the last two incremental Gold refreshes. It summarizes refreshed rows, affected customers, recomputed dates, and daily deltas, making it easier to understand the operational impact of each incremental execution without scanning orchestration or dbt logs.
 
+The views below are part of the full dashboard available at [http://34.69.8.242:8501](http://34.69.8.242:8501).
 ---
 
 ## Prerequisites
